@@ -87,6 +87,11 @@ void ArchiveSession::emit_file(void *context, const char *name,
   if (!list.ok)
     return;
   auto &session = *list.session;
+  if (list.count == UINT16_MAX) {
+    list.ok = false;
+    list.failure_detail = "count";
+    return;
+  }
   const std::size_t name_length = std::strlen(name);
   const std::size_t payload_max = session.payload_max();
   if (payload_max < 6 || name_length + 5 > payload_max || name_length > 400) {
@@ -99,7 +104,7 @@ void ArchiveSession::emit_file(void *context, const char *name,
     }
     // An incomplete listing must not look like an empty archive to a client.
     list.ok = false;
-    list.unsendable = true;
+    list.failure_detail = "mtu";
     return;
   }
   std::uint8_t frame[5 + 400];
@@ -122,23 +127,28 @@ void ArchiveSession::emit_file(void *context, const char *name,
 
 void ArchiveSession::list() {
   ListContext list{this};
-  const unsigned partials = archive_.list(archive_.context, emit_file, &list);
+  const ListResult result = archive_.list(archive_.context, emit_file, &list);
+  if (!result.complete) {
+    error(ble::kOpList, ble::kErrStorage);
+    return;
+  }
   if (!list.ok) {
-    if (list.unsendable)
-      error(ble::kOpList, ble::kErrBusy, payload_max() >= 6 ? "mtu" : nullptr);
+    if (list.failure_detail)
+      error(ble::kOpList, ble::kErrBusy,
+            payload_max() >= 3 + std::strlen(list.failure_detail)
+                ? list.failure_detail
+                : nullptr);
     return;
   }
   std::uint8_t frame[13];
   frame[0] = ble::kFrameListEnd;
   put_u16(frame + 1, list.count);
-  put_u16(frame + 3,
-          static_cast<std::uint16_t>(partials > 65535 ? 65535 : partials));
+  put_u16(frame + 3, static_cast<std::uint16_t>(
+                         result.partials > 65535 ? 65535 : result.partials));
   put_u32(frame + 5, archive_.total_kib(archive_.context));
   put_u32(frame + 9, archive_.used_kib(archive_.context));
-  respond(frame, sizeof(frame));
-  // Preserve the existing LIST semantics: finishing enumeration clears the
-  // new-files hint, even if the final LIST_END notification is refused.
-  if (archive_.listed)
+  // A failed terminal delivery leaves the client without a complete snapshot.
+  if (respond(frame, sizeof(frame)) && archive_.listed)
     archive_.listed(archive_.context);
 }
 

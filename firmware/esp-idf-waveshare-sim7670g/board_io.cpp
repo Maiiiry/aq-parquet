@@ -5,11 +5,13 @@
 #include <esp_vfs_fat.h>
 #include <freertos/FreeRTOS.h>
 #include <led_strip.h>
+#include <sd_transfer_buffer.h>
 #include <sdmmc_cmd.h>
 
 namespace board {
 namespace {
 sdmmc_card_t *card = nullptr;
+aq::storage::SdTransferBuffer sd_transfer_buffer;
 i2c_master_bus_handle_t gauge_bus = nullptr;
 i2c_master_dev_handle_t gauge = nullptr;
 led_strip_handle_t led = nullptr;
@@ -54,6 +56,13 @@ bool mount_card() {
     return true;
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
   host.flags = SDMMC_HOST_FLAG_1BIT;
+  // Reserve once before radios start; FatFs buffers can live in PSRAM while
+  // SDMMC on this board still requires an internal DMA staging buffer.
+  if (!sd_transfer_buffer.reserve())
+    return false;
+  host.dma_aligned_buffer = sd_transfer_buffer.data();
+  host.unaligned_multi_block_rw_max_chunk_size =
+      aq::storage::SdTransferBuffer::kSectors;
   sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
   slot.width = 1;
   slot.clk = GPIO_NUM_5;
@@ -67,8 +76,10 @@ bool mount_card() {
   const esp_err_t result =
       esp_vfs_fat_sdmmc_mount("/sd", &host, &slot, &config, &mounted);
   // IDF mount helper releases its host/FAT resources on failure.
-  if (result != ESP_OK)
+  if (result != ESP_OK) {
+    sd_transfer_buffer.release();
     return false;
+  }
   card = mounted;
   return true;
 }

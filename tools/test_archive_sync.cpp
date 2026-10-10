@@ -31,6 +31,7 @@ struct Error {
   std::uint8_t peer;
   ble::Op op;
   ble::Error code;
+  std::string detail;
 };
 struct Fixture {
   std::string directory;
@@ -42,8 +43,10 @@ struct Fixture {
                                                              1024};
   std::vector<std::string> names{"sample.parquet"};
   unsigned partials = 70000;
+  unsigned list_repeats = 1;
   unsigned listed = 0, progress = 0, locks = 0, lock_depth = 0;
   bool complete = true;
+  bool listing_complete = true;
   std::size_t refuse_frame = 0;
   std::size_t disconnect_frame = 0;
 
@@ -69,9 +72,10 @@ struct Fixture {
         this,
         [](void *ctx, aqsync::FileEmitter emit, void *out) {
           auto &f = *static_cast<Fixture *>(ctx);
-          for (const auto &name : f.names)
-            emit(out, name.c_str(), f.bytes.size());
-          return f.partials;
+          for (unsigned repeat = 0; repeat < f.list_repeats; ++repeat)
+            for (const auto &name : f.names)
+              emit(out, name.c_str(), f.bytes.size());
+          return aqsync::ListResult{f.partials, f.listing_complete};
         },
         [](void *ctx, const char *name, char *path, std::size_t size) {
           auto &f = *static_cast<Fixture *>(ctx);
@@ -130,7 +134,7 @@ struct Fixture {
                      f.payload[slot(link, peer)]);
               if (generation != f.generation[slot(link, peer)])
                 return false;
-              f.errors.push_back({link, peer, op, error});
+              f.errors.push_back({link, peer, op, error, detail ? detail : ""});
               return true;
             },
             [](void *ctx) { ++static_cast<Fixture *>(ctx)->progress; }};
@@ -233,6 +237,39 @@ int main(int argc, char **argv) {
   expect_error(f, ble::kErrBusy);
   assert(f.listed == 1); // no false empty listing or cleared new-files hint
   f.payload[0] = 517;
+
+  // SD failure after FILE frames is an error, never a successful prefix.
+  for (const auto link : {ble::Link::Ble, ble::Link::Lan}) {
+    f.clear();
+    f.listing_complete = false;
+    session.handle(request(f, ble::kOpList, link), true);
+    assert(f.frames.size() == 1 && f.frames[0].bytes[0] == ble::kFrameFile);
+    assert(f.errors.size() == 1 && f.errors[0].op == ble::kOpList &&
+           f.errors[0].code == ble::kErrStorage && f.errors[0].link == link);
+    assert(f.listed == 1);
+  }
+  f.listing_complete = true;
+  f.clear();
+  f.refuse_frame = 2; // LIST_END delivery fails after a successful traversal.
+  session.handle(request(f, ble::kOpList), true);
+  assert(f.frames.size() == 2 && f.listed == 1);
+  f.clear();
+  session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
+  assert(f.frames.size() == 2 && f.listed == 2 && f.errors.empty());
+  f.clear();
+  f.list_repeats = 65535;
+  session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
+  assert(f.frames.size() == 65536 && f.listed == 3 && f.errors.empty());
+  assert(f.frames.back().bytes[0] == ble::kFrameListEnd &&
+         get_u16(f.frames.back().bytes.data() + 1) == 65535);
+  f.clear();
+  f.list_repeats = 65536; // LIST_END's u16 count cannot wrap to zero.
+  session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
+  assert(f.frames.size() == 65535 &&
+         f.frames.back().bytes[0] == ble::kFrameFile && f.listed == 3);
+  assert(f.errors.size() == 1 && f.errors[0].code == ble::kErrBusy &&
+         f.errors[0].detail == "count");
+  f.list_repeats = 1;
 
   auto handle = open(f, session);
   f.clear();

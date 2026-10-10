@@ -139,6 +139,12 @@ directory creation errors/races with ASan/UBSan. Shared archive path creation
 must recognize an existing mounted root via `stat`; FatFs returns `EINVAL`
 from `mkdir` at that root. Only the storage worker calls these helpers.
 
+`pixi run sd-transfer-buffer-test` checks the shared heap-owned SD DMA buffer
+reservation, allocation failure, reuse while further allocations are denied,
+failed-mount release/retry and final ownership cleanup with ASan/UBSan. Both
+board adapters reserve 4 KiB before radios and pass it to the pinned SDK for
+eight-sector chunks. This fixture checks ownership, not SD or radio timing.
+
 The LAN task waits for socket readiness with a 100 ms housekeeping timeout; it
 no longer sleeps after every request. The archive worker checks one sample and
 one command per pass, and waits on a binary wakeup only when idle. All sample,

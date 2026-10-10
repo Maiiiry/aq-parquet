@@ -594,7 +594,8 @@ bool finalize_file(OutputFile &target) {
       "PARQUET READY name=%s-%lld-%lu.parquet rows=%u row_groups=%u "
       "first=%lld last=%lld bytes=%lu crc32=%08lx write_us=%lu sync_us=%llu "
       "heap_free=%lu psram_free=%lu stack_free=%u codec=%s codec_us=%llu "
-      "writer_us=%llu codec_workspace_bytes=%u heap_min=%lu\n",
+      "writer_us=%llu codec_workspace_bytes=%u heap_min=%lu "
+      "dma_free=%lu dma_largest=%lu dma_min=%lu\n",
       target.stem, static_cast<long long>(target.last),
       static_cast<unsigned long>(target.attempt), unsigned(target.rows),
       unsigned(target.writer.row_groups()),
@@ -609,7 +610,13 @@ bool finalize_file(OutputFile &target) {
       static_cast<unsigned long long>(target.writer_us),
       unsigned(sizeof(Lz4Workspace)),
       static_cast<unsigned long>(
-          heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)));
+          heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+      static_cast<unsigned long>(
+          heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+      static_cast<unsigned long>(heap_caps_get_largest_free_block(
+          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+      static_cast<unsigned long>(heap_caps_get_minimum_free_size(
+          MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)));
   return true;
 }
 
@@ -657,62 +664,51 @@ void emit_file_serial(void *, const char *name, std::uint32_t bytes) {
                static_cast<unsigned long>(bytes));
 }
 
-void list_directory(const char *relative, unsigned depth, unsigned &partials,
-                    FileEmitter emit, void *context,
+struct ArchiveDirectoryIO {
+  static DIR *open(const char *path) {
+    BusLock lock;
+    return ::opendir(path);
+  }
+  static const struct dirent *read(DIR *directory) {
+    BusLock lock;
+    errno = 0;
+    return ::readdir(directory);
+  }
+  static int inspect(const char *path, struct stat *info) {
+    BusLock lock;
+    return ::stat(path, info);
+  }
+  static int close(DIR *directory) {
+    BusLock lock;
+    return ::closedir(directory);
+  }
+};
+
+bool list_directory(unsigned &partials, FileEmitter emit, void *context,
                     const char *base = kDirectory,
                     const char *export_prefix = "") {
-  if (depth > 6)
-    return;
-  char directory_path[416];
-  std::snprintf(directory_path, sizeof(directory_path), "%s/%s", base,
-                relative);
-  DIR *directory;
-  {
-    BusLock lock;
-    directory = ::opendir(directory_path);
-  }
-  if (!directory) {
-    aqlog.println("PARQUET ERROR operation=list");
-    return;
-  }
-  for (;;) {
-    const struct dirent *entry;
-    {
-      BusLock lock;
-      entry = ::readdir(directory);
-    }
-    if (!entry)
-      break;
-    if (entry->d_name[0] == '.')
-      continue;
-    char name[384], path[416];
-    const int length = std::snprintf(name, sizeof(name), "%s%s%s", relative,
-                                     *relative ? "/" : "", entry->d_name);
-    if (length < 0 || std::size_t(length) >= sizeof(name))
-      continue;
-    std::snprintf(path, sizeof(path), "%s/%s", base, name);
-    struct stat info{};
-    int stat_result;
-    {
-      BusLock lock;
-      stat_result = ::stat(path, &info);
-    }
-    if (stat_result != 0)
-      continue;
-    if (S_ISDIR(info.st_mode))
-      list_directory(name, depth + 1, partials, emit, context, base,
-                     export_prefix);
-    else if (safe_name(name)) {
+  ArchiveDirectoryIO io;
+  auto visit = [&](const char *name, const struct stat &info) {
+    if (S_ISREG(info.st_mode) && safe_name(name)) {
+      if (info.st_size < 0 ||
+          static_cast<std::uint64_t>(info.st_size) > UINT32_MAX) {
+        errno = EOVERFLOW;
+        return false;
+      }
       char exported[400];
-      std::snprintf(exported, sizeof(exported), "%s%s", export_prefix, name);
+      const int length = std::snprintf(exported, sizeof(exported), "%s%s",
+                                       export_prefix, name);
+      if (length < 0 || static_cast<std::size_t>(length) >= sizeof(exported)) {
+        errno = ENAMETOOLONG;
+        return false;
+      }
       emit(context, exported, static_cast<std::uint32_t>(info.st_size));
-    } else if (std::strstr(name, ".partial"))
+    } else if (std::strstr(name, ".partial") && partials != UINT32_MAX) {
       ++partials;
-  }
-  {
-    BusLock lock;
-    ::closedir(directory);
-  }
+    }
+    return true;
+  };
+  return aq::logger::detail::walk_directory(io, base, "", 0, visit);
 }
 
 bool partial_name(const char *name) {
@@ -851,23 +847,40 @@ unsigned quarantine_partials() {
   return quarantined;
 }
 
-// Walks the output tree and the legacy directory; returns retained partials.
-unsigned list_all(FileEmitter emit, void *context) {
-  unsigned partials = 0;
-  list_directory("", 0, partials, emit, context);
-  struct stat legacy{};
-  bool has_legacy;
-  {
-    BusLock lock;
-    has_legacy = config.legacy_directory &&
-                 ::stat(config.legacy_directory, &legacy) == 0 &&
-                 S_ISDIR(legacy.st_mode);
+// Walk every configured archive tree; only a complete scan replaces counters.
+aqsync::ListResult list_all(FileEmitter emit, void *context) {
+  aqsync::ListResult result;
+  result.complete = list_directory(result.partials, emit, context);
+  if (result.complete && config.legacy_directory) {
+    struct stat legacy{};
+    int stat_result;
+    int stat_error;
+    {
+      BusLock lock;
+      stat_result = ::stat(config.legacy_directory, &legacy);
+      stat_error = errno;
+    }
+    if (stat_result == 0) {
+      if (S_ISDIR(legacy.st_mode)) {
+        result.complete =
+            list_directory(result.partials, emit, context,
+                           config.legacy_directory, "legacy-parquet/");
+      } else {
+        errno = ENOTDIR;
+        result.complete = false;
+      }
+    } else if (stat_error != ENOENT) {
+      errno = stat_error;
+      result.complete = false;
+    }
   }
-  if (has_legacy)
-    list_directory("", 0, partials, emit, context, config.legacy_directory,
-                   "legacy-parquet/");
-  partials_seen = partials;
-  return partials;
+  if (result.complete) {
+    partials_seen = result.partials;
+  } else {
+    ++errors;
+    aqlog.printf("PARQUET ERROR operation=list errno=%d\n", errno);
+  }
+  return result;
 }
 
 void list_files(bool emit_serial = true) {
@@ -878,9 +891,12 @@ void list_files(bool emit_serial = true) {
     if (files != UINT32_MAX)
       ++files;
   };
-  const unsigned partials =
+  const aqsync::ListResult result =
       list_all(emit_serial ? emit_file_serial : count_file,
                emit_serial ? nullptr : &count);
+  if (!result.complete)
+    return;
+  const unsigned partials = result.partials;
   if (!emit_serial) {
     // Startup must not wait for a USB reader to drain an archive-sized dump.
     // Enumeration/stats still run on this worker with the same bus ownership.

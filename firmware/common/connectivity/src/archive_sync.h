@@ -10,6 +10,11 @@ namespace aqsync {
 using FileEmitter = void (*)(void *context, const char *name,
                              std::uint32_t bytes);
 
+struct ListResult {
+  unsigned partials = 0;
+  bool complete = false;
+};
+
 // Board/archive policy: enumerating and resolving the mounted archive,
 // checking finalized Parquet files, storage statistics and its bus mutex.
 // All callbacks run only on the caller's storage worker. The module never
@@ -19,7 +24,9 @@ using FileEmitter = void (*)(void *context, const char *name,
 // listed/log are optional. Contexts must outlive the session.
 struct ArchiveHooks {
   void *context = nullptr;
-  unsigned (*list)(void *, FileEmitter, void *) = nullptr;
+  // complete is true only after every configured archive tree was read. FILE
+  // frames already emitted during a failed walk are an incomplete snapshot.
+  ListResult (*list)(void *, FileEmitter, void *) = nullptr;
   bool (*resolve)(void *, const char *, char *, std::size_t) = nullptr;
   bool (*finalized)(void *, const char *, std::uint32_t &,
                     std::uint32_t &) = nullptr;
@@ -80,7 +87,7 @@ private:
     ArchiveSession *session;
     std::uint16_t count = 0;
     bool ok = true;
-    bool unsendable = false;
+    const char *failure_detail = nullptr;
   };
   static constexpr std::size_t kPayloadCapacity = 1024;
   ArchiveHooks archive_;

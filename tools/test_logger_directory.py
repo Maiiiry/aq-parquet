@@ -1,4 +1,4 @@
-"""Check mounted-root creation, existing-file rejection and mkdir races."""
+"""Check directory creation and truthful archive traversal under SD failures."""
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ def main() -> None:
             command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
         subprocess.run(command, check=True)
         subprocess.run([str(executable)], check=True)
-    print("Logger directory checks passed: FatFs root, file rejection, denied access and mkdir races")
+    print("Logger directory checks passed: FatFs root, mkdir races and complete archive/error traversal")
 
 
 if __name__ == "__main__":

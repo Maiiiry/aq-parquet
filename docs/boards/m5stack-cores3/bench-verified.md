@@ -1,7 +1,7 @@
 # Bench-verified board record
 
-**Framework scope, 2026-10-09:** Current source is native ESP-IDF 6.1 and its
-build/host gates pass. The separately dated
+**Framework scope, 2026-10-10:** Current source is native ESP-IDF 6.1 and its
+build/host gates pass. The dated LAN memory recovery below and the
 [first native flash/readback](#board-1-first-native-esp-idf-flash-and-readback)
 below qualifies a short CoreS3 run. Earlier physical observations, images,
 old API/tool commands and performance figures belong to historical Arduino
@@ -9,6 +9,73 @@ builds; retain those identities when using this evidence.
 
 
 [Router](../../README.md) · Everything else in `docs/` is source-checked against schematics and vendor code. This file records only what was **measured on real hardware in this project**, with the date and the method. If a claim elsewhere disagrees with this file, this file wins for the board listed here.
+
+## Board 1, native LAN memory and complete-list recovery
+
+Verified **2026-10-10**, CoreS3 MAC `44:1b:f6:e2:6b:40`, native ESP-IDF
+6.1 (`fff9895c82d744c7237be8847347bdd1b07c6643`) and the existing SD archive.
+Old v6.10 LAN refreshes returned successful prefixes of 12–13 files ending
+near 02:30–02:45 local time, while USB listed 35 files including the morning
+and new afternoon files. During the LAN refresh, serial captured
+`sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101` and
+`diskio_sdmmc: sdmmc_read_blocks failed (0x101)`. A later old-image flush
+reported internal heap minimum 952 bytes. The observed fault was DMA allocation
+pressure plus directory errors being treated as EOF, not missing source files.
+
+Repeated port/chip/flash-ID/read-only eFuse checks identified the same ESP32-S3,
+16 MB Quad flash and recoverable security state. Before writing, a full
+16,777,216-byte backup was verified at
+`backup/m5stack-cores3-flash-20261010T135448Z.bin`, SHA-256
+`71179bc0634e350dbddad6aa4581f3d2c9b07a219d3053eef1dc2b6fa8da9912`.
+Pending old-image rows were explicitly flushed before the backup/reset and
+again immediately before flashing. NVS, pairing, station identity and SD files
+were preserved; no card format, file deletion or eFuse write occurred.
+
+Installed **v6.11**, application size 1,521,200 bytes, SHA-256
+`50e8b39ccc4361c469332e9f17e7a8cf3a949e08378f9265023597e43ac39118`;
+esptool verified written hashes. Station remained
+`f3c3fdc1-6f18-4be8-b7bb-fb27692bb60a`; new boot ID was
+`3e66a92f480d8e9adc4bfc31923c9261`. SD mounted using a persistent heap-owned
+4,096-byte internal DMA buffer with eight-sector chunks, reserved before radios.
+At the `sd-mounted` stage, DMA free/largest/minimum were
+195,583 / 122,880 / 159,348 bytes. These startup measurements precede Wi-Fi load
+and must not be read as loaded headroom. Wi-Fi/lwIP prefer PSRAM, with eight
+static RX and eight static TX buffers and bounded software queues.
+
+The updated Android debug app on the OnePlus 7 Pro connected over authenticated
+LAN and automatically copied three new files (97,718 bytes), zero failures.
+The phone displayed 37/37 checked files including 08:00; independent USB LIST
+returned 37. A subsequent LAN refresh again returned 37, and the interactive
+session stayed ready beyond five minutes without reconnection. Ten-second
+sampling continued with zero reported drops during the passive capture.
+
+At the next automatic quarter-hour boundary, v6.11 finalized
+`data_1400_3e66a92f480d8e9adc4bfc31923c9261_0-89-0.parquet`: 90 rows,
+one row group, 49,839 bytes, CRC-32 `bf653c17`. Background sync requested from
+the phone's Files menu discovered and copied this file over LAN, zero failures;
+the phone then showed 38/38 checked files. Read-only extraction from the phone
+matched that size/CRC and SHA-256
+`c12d21fe2dce097b4f725d3eed959bdadbe8f91ed9cae5cba6801e0dc95fa4a6`.
+PyArrow and DuckDB read all 90 rows and 81 columns; sequence 0–89 was complete,
+UTC ranged 14:00:06.445829–14:14:57.471461, and drop, missed-deadline, storage,
+PMS checksum and PMS length error fields were all zero. Acquisition continued
+after finalization. At READY under the connected LAN load, DMA free/largest/min
+were 19,767 / 19,456 / 18,296 bytes; internal free/min were 27,555 / 26,084,
+PSRAM free was 8,146,416 and storage-task free-stack report was 10,208 bytes.
+These are one boot's observed values, not qualified worst-case margins.
+
+Sanitized Parquet writer conformance, SD-buffer ownership/reuse/allocation-failure tests, directory failure
+tests and archive incomplete/terminal-delivery/count-overflow tests passed.
+Formatting, lint, both board telemetry contracts, and native CoreS3, Waveshare
+logger and Waveshare diagnostic builds/target gates passed. Waveshare changes
+are build/host-verified only; that board was not flashed for this change.
+Android's full verify gate passed separately. This short check does not qualify
+overnight endurance, full-card throughput or power-cut durability.
+
+Evidence is ignored under
+`firmware/esp-idf-cores3/artifacts/lan-memory-20261010/`: before/after phone
+screenshots, serial DMA failure capture, sanitized Android receipt summary,
+backup/flash logs, boot output, USB listing and the passive post-flash capture.
 
 ## Board 1, first unit
 

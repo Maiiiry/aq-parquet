@@ -19,10 +19,15 @@ in `../../docs/boards/m5stack-cores3/` (start at its `README.md`).
   `AQCommon` own their services; never add a second owner for a bus/radio.
 - M134/PMSA003 is optional. Preserve missing sensor values as null, and keep
   RTC writes on the main task rather than the storage worker.
-- Current firmware is `idf-cores3-parquet-v6.10`, schema v4/dictionary v3 with
+- Current firmware is `idf-cores3-parquet-v6.11`, schema v4/dictionary v3 with
   81 fields. Preserve the original 77-field prefix. H3 and NTP policy are
   shared services: capture coarsened station location with each sample, keep
   country owner-declared, and never initialize GPS or infer country here.
+- Reserve the heap-owned 4 KiB internal DMA SD transfer buffer before starting
+  radios; keep it alive for the mount and reuse it for eight-sector chunks.
+  Shared connectivity prefers PSRAM for packet/TCP memory and bounds static
+  Wi-Fi DMA buffers. Preserve that policy and measure free/largest/minimum DMA
+  heap under actual LAN load before claiming memory or throughput headroom.
 - Keep test captures and image hashes in ignored `artifacts/`, outside `build/`.
   Real board observations go in `../../docs/boards/m5stack-cores3/bench-verified.md`.
 - Before flash, follow the root `AGENTS.md` port, eFuse, size and full-backup

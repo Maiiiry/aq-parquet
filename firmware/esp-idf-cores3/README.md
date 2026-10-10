@@ -1,7 +1,7 @@
 # CoreS3 native ESP-IDF logger
 
 The current source is a pure **ESP-IDF 6.1** application, firmware identity
-**`idf-cores3-parquet-v6.10`**, with an **81-column** CoreS3 schema
+**`idf-cores3-parquet-v6.11`**, with an **81-column** CoreS3 schema
 `cores3-telemetry-v4` and dictionary `cores3-telemetry-v3`. The original 77
 columns retain their names, types and order; four nullable H3 location fields
 are appended. `bringup/main.cpp` owns board setup, sensors, display and native
@@ -66,6 +66,25 @@ IMU/light/touch acquisition and BM8563 RTC callbacks. AQLogger owns the
 10-second monotonic deadline and the sole archive worker after startup.
 Missing measurements and unknown UTC remain null; finalized Parquet remains
 immutable and interrupted `.partial` files remain retained.
+
+The SD adapter reserves one **4 KiB internal DMA buffer before radios start**
+and lends it to ESP-IDF through `sdmmc_host_t::dma_aligned_buffer`. It stays
+allocated for the mount, avoiding per-transfer DMA allocations when FatFs
+buffers live in PSRAM. Eight-sector chunks retain bounded multi-block reads
+and writes. Failed mounts release the reservation. This follows the pinned
+[ESP-IDF 6.1 SD transfer guidance](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/api-reference/storage/sdmmc.html#unaligned-buffer-performance);
+the automatic allocation flag applies to non-SPI initialization, so this
+SDSPI adapter supplies its own buffer.
+
+Shared connectivity now prefers PSRAM for Wi-Fi/lwIP packet storage, with
+**eight static RX and eight static TX DMA buffers**, **32 software RX buffers**
+and **16 cached TX buffers**. Hardware buffers reserve approximately **25.6 KiB**;
+software packets and TCP allocations use PSRAM first, with internal fallback.
+The TCP send/receive limits remain **5,760 bytes per socket**, for three LAN
+clients, plus SDK metadata. Startup and finalized-file logs report DMA free,
+largest-block and minimum-free values. These bounds follow the SDK's
+[PSRAM Wi-Fi guidance](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/api-guides/wifi-driver/wifi-performance-and-power-save.html#using-psram);
+actual peak memory, radio coexistence and transfer rates require board evidence.
 
 Location starts unset. Owner provisioning supplies a cell, configurable maximum
 resolution (default **5**) and optional declared ISO country code. Only the

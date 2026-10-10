@@ -1,7 +1,7 @@
 # Waveshare V2 native ESP-IDF / PMS5003T logger
 
 The current source is pure **ESP-IDF 6.1**, firmware identity
-**`idf-waveshare-parquet-v2.4`**, with **56-column** schema
+**`idf-waveshare-parquet-v2.5`**, with **56-column** schema
 `waveshare-sim7670g-telemetry-v3` and dictionary `waveshare-sim7670g-telemetry-v3`.
 The original 52 columns retain their names, types and order, with four nullable
 H3 location fields appended. The board has two native variants:
@@ -65,6 +65,16 @@ no verified ESP32 signal. Modem, GNSS and camera remain outside this logger.
 AQLogger owns the 10-second monotonic sampling and sole archive worker;
 there is no external RTC anchor. Raw PM/temperature/RH and optional sensor
 identity/batch candidate semantics retain the existing dictionary contract.
+
+Both variants reserve a heap-owned **4 KiB internal DMA transfer buffer** before
+mounting TF and lend it to ESP-IDF for **eight-sector chunks**. The single card
+owner retains it for the mount; failed mounts release it. This prevents
+per-transfer DMA allocation when FatFs buffers live in PSRAM. The logger's
+shared connectivity prefers PSRAM for Wi-Fi/lwIP packets and uses **eight
+static RX and eight static TX DMA buffers**, **32 software RX buffers** and
+**16 cached TX buffers**. The diagnostic has no radios or PSRAM. These changes
+use the pinned SDK's [SD buffer API](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/api-reference/storage/sdmmc.html#unaligned-buffer-performance);
+native Waveshare throughput/coexistence remains unqualified.
 
 Location starts unset. Owner provisioning supplies a cell, configurable maximum
 resolution (default **5**) and optional declared ISO country code. Only the

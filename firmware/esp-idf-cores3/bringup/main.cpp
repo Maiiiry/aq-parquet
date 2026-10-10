@@ -5,6 +5,7 @@
 #include "wifi_link.h"
 #include <M5Unified.h>
 #include <pms_frame.h>
+#include <sd_transfer_buffer.h>
 
 #include "aq_console.h"
 #include <driver/sdspi_host.h>
@@ -48,6 +49,7 @@ constexpr int kPmsTx = 17;
 constexpr uart_port_t kPmsPort = UART_NUM_1;
 bool pms_uart_ready = false;
 sdmmc_card_t *sd_card = nullptr;
+aq::storage::SdTransferBuffer sd_transfer_buffer;
 
 std::uint32_t monotonic_ms() {
   return static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
@@ -225,6 +227,19 @@ void report_memory() {
           heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
 }
 
+void report_dma_memory(const char *stage) {
+  constexpr auto caps = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
+  aqlog.printf(
+      "DIAG dma stage=%s free=%lu largest=%lu min_free=%lu "
+      "sd_buffer_bytes=%u\n",
+      stage, static_cast<unsigned long>(heap_caps_get_free_size(caps)),
+      static_cast<unsigned long>(heap_caps_get_largest_free_block(caps)),
+      static_cast<unsigned long>(heap_caps_get_minimum_free_size(caps)),
+      sd_transfer_buffer.data()
+          ? static_cast<unsigned>(aq::storage::SdTransferBuffer::kBytes)
+          : 0);
+}
+
 void report_i2c() {
   unsigned found = 0;
   unsigned unexpected = 0;
@@ -294,6 +309,8 @@ void report_rtc_imu_touch() {
 }
 
 bool report_sd() {
+  if (sd_card)
+    return true;
   const auto board = M5.getBoard();
   if (board != m5::board_t::board_M5StackCoreS3 &&
       board != m5::board_t::board_M5StackCoreS3SE) {
@@ -312,6 +329,17 @@ bool report_sd() {
   // This shared LCD bus/card failed the subsequent CSD check at 25 MHz on
   // the first native flash; retain default-speed mode until qualified.
   host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+  // FatFs metadata/file buffers may live in PSRAM. Reserve the DMA bounce
+  // buffer now, before Wi-Fi/TCP bursts compete for internal RAM. The SDK's
+  // ALLOC_ALIGNED_BUF flag only allocates automatically for non-SPI hosts.
+  if (!sd_transfer_buffer.reserve()) {
+    aqlog.println("DIAG sd mounted=false status=dma_buffer_unavailable "
+                  "format_attempted=false");
+    return false;
+  }
+  host.dma_aligned_buffer = sd_transfer_buffer.data();
+  host.unaligned_multi_block_rw_max_chunk_size =
+      aq::storage::SdTransferBuffer::kSectors;
   sdspi_device_config_t device = SDSPI_DEVICE_CONFIG_DEFAULT();
   device.host_id = SPI2_HOST;
   device.gpio_cs = static_cast<gpio_num_t>(kSdCs);
@@ -321,6 +349,7 @@ bool report_sd() {
   const esp_err_t result =
       esp_vfs_fat_sdspi_mount("/sd", &host, &device, &mount, &sd_card);
   if (result != ESP_OK) {
+    sd_transfer_buffer.release();
     aqlog.printf("DIAG sd mounted=false status=missing_or_mount_failed "
                  "error=%d format_attempted=false\n",
                  result);
@@ -331,12 +360,13 @@ bool report_sd() {
   aqlog.printf(
       "DIAG sd mounted=true card_bytes=%llu total_bytes=%llu "
       "used_bytes=%llu capacity_error=%d clock_hz=%d "
-      "spi_host=SPI2 sck=%d miso=%d mosi=%d cs=%d\n",
+      "spi_host=SPI2 sck=%d miso=%d mosi=%d cs=%d dma_buffer_bytes=%u\n",
       static_cast<unsigned long long>(sd_card->csd.capacity) *
           sd_card->csd.sector_size,
       static_cast<unsigned long long>(total),
       static_cast<unsigned long long>(total >= free ? total - free : 0),
-      capacity, sd_card->real_freq_khz * 1000, kSdSck, kSdMiso, kSdMosi, kSdCs);
+      capacity, sd_card->real_freq_khz * 1000, kSdSck, kSdMiso, kSdMosi, kSdCs,
+      static_cast<unsigned>(aq::storage::SdTransferBuffer::kBytes));
   return true;
 }
 
@@ -826,11 +856,13 @@ static void board_begin() {
   report_power();
   report_rtc_imu_touch();
   sd_mounted = report_sd();
+  report_dma_memory("sd-mounted");
   start_pms();
   telemetry::begin_logger(sd_mounted);
   if (kEnableBle) {
     ble_started = telemetry::start_links(M5.getDisplayCount() > 0);
     last_ble_ui_generation = ble::ui_generation() + lan::ui_generation();
+    report_dma_memory("links-started");
   }
   show_pms_screen();
   last_display_ms = monotonic_ms();

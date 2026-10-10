@@ -18,6 +18,10 @@ pinned ESP-IDF toolchain, component manifests and partition files. Never borrow 
 - AQLogger, AQConnectivity, AQRuntime and AQCommon own shared application
   services. Board code supplies only descriptors, sensor collection, card
   capacity hooks and board GPIO setup. No second radio initializer.
+- Reserve the heap-owned 4 KiB internal DMA SD transfer buffer before radios
+  and retain it while mounted. Shared connectivity prefers PSRAM for packet/TCP
+  memory and bounds static Wi-Fi DMA buffers; the diagnostic excludes radios
+  and PSRAM. Source/host validation does not qualify this board's native IO.
 - GPIO38 RGB is a board-local startup/card/sensor indicator. Camera, modem,
   GNSS and charger control are disabled. The board adapter alone owns MAX17048
   I²C on SDA15/SCL16; never initialize that controller from another driver.
@@ -28,7 +32,7 @@ pinned ESP-IDF toolchain, component manifests and partition files. Never borrow 
   still cannot prove battery presence. Read failures leave battery fields null.
   Charger state has no verified ESP32 signal. No external RTC: UTC remains null until a real host or network anchor,
   and a reboot starts a new unanchored clock epoch.
-- Current firmware is `idf-waveshare-parquet-v2.4`, schema v3/dictionary v3
+- Current firmware is `idf-waveshare-parquet-v2.5`, schema v3/dictionary v3
   with 56 fields. Preserve the original 52-field prefix. Shared H3 helpers
   publish only the owner-configured coarsened station cell and its center;
   country is optional and owner-declared. Do not turn on modem GNSS for this.
