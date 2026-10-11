@@ -9,6 +9,7 @@
 // The display loop reads pairing()/link() and draws; nothing here draws.
 
 #include "device_config.h"
+#include "disconnect.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,8 @@ enum Op : std::uint8_t {
   kOpReboot = 0x0b,
   kOpLogTail = 0x0c,
   kOpGetToken = 0x0d,
+  kOpGetDiag = 0x0e,
+  kOpAbort = 0x0f,
 };
 enum Frame : std::uint8_t {
   kFrameFile = 0x10,
@@ -70,6 +73,9 @@ enum Frame : std::uint8_t {
   kFrameStatus = 0x48,
   kFrameLive = 0x49,
   kFrameConfigChunk = 0x4a,
+  kFrameBye = 0x4b,
+  kFrameDiag = 0x4c,
+  kFrameAborted = 0x4d,
   kFrameError = 0x7f,
 };
 enum Error : std::uint8_t {
@@ -88,6 +94,7 @@ enum Error : std::uint8_t {
   kErrNotOnThisLink = 13,
   kErrAuth = 14,
   kErrWifiUnavailable = 15,
+  kErrAborted = 16,
 };
 
 // Advertising service data (protocol v2.1, docs/shared/ble-sync-protocol.md
@@ -162,6 +169,10 @@ const char *info_json();
 config::PairMode pair_mode();
 // Forgets every bonded peer (ble.clear_bonds). Safe from any task.
 void clear_bonds();
+// Ends the current link and records `reason` as its disconnect event. Safe
+// from any task; a no-op without a connection. link().connected turns false
+// only after the event is recorded.
+void disconnect(DisconnectReason reason);
 
 // From the sampling loop, after the row was queued. Payloads <= kMaxJson.
 // Cache the complete value; omit notifications exceeding negotiated MTU - 3.

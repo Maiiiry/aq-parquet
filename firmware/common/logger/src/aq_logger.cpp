@@ -1195,8 +1195,9 @@ std::size_t build_status_json(char *out, std::size_t size) {
   view.codec = selected_codec.load();
   view.utc = generation != 0;
   view.generation = generation;
-  view.clock_source = generation ? source : kClockNone;
-  view.rtc_state = rtc_state.load();
+  view.clock_source =
+      static_cast<std::uint8_t>(generation ? source : kClockNone);
+  view.rtc_state = static_cast<std::uint8_t>(rtc_state.load());
   if (generation) {
     view.utc_ms = aq::utc::estimate_ns(now, mono_anchor, utc_anchor) / 1000000;
     view.clock_age_seconds = (now - mono_anchor) / 1000000;
@@ -1211,6 +1212,10 @@ std::size_t build_status_json(char *out, std::size_t size) {
   view.quarantine_bytes = quarantine_bytes.load();
   view.open_rows = open_rows.load();
   view.open_groups = open_groups.load();
+  const auto disconnects = ble::disconnect_stats();
+  view.disconnects = static_cast<std::uint16_t>(
+      std::min<std::uint32_t>(disconnects.count, UINT16_MAX));
+  view.last_disconnect = static_cast<std::uint8_t>(disconnects.last);
   return format_status(view, out, size);
 }
 
@@ -1670,8 +1675,14 @@ void handle_control_request(const ble::ControlRequest &request,
     aqlog.printf("PARQUET REBOOT source=%s delay_ms=%u\n",
                  request.link == ble::Link::Lan ? "lan" : "ble",
                  unsigned(kDelayMs));
+    // LAN sessions hear BYE reboot before their sockets vanish.
+    lan::drop_session(ble::DisconnectReason::Reboot);
     aq::console::flush();
     vTaskDelay(pdMS_TO_TICKS(kDelayMs));
+    // After the delay REBOOTING has left; a BLE peer gets a recorded close too.
+    ble::disconnect(ble::DisconnectReason::Reboot);
+    for (int waited = 0; waited < 20 && ble::link().connected; ++waited)
+      vTaskDelay(pdMS_TO_TICKS(10));
     esp_restart();
     return;
   }

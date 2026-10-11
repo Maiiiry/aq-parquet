@@ -65,7 +65,7 @@ void check_blob_header() {
          crc32(blob.data() + kHeaderBytes, kPayloadBytes));
 }
 std::string log_text() {
-  static char logs[DebugLog::kRingBytes + 1];
+  static char logs[DebugLog::kFallbackRingBytes + 1];
   std::uint32_t total = 0;
   const auto count = aqlog.tail(logs, sizeof(logs) - 1, total);
   logs[count] = '\0';
@@ -255,7 +255,7 @@ void credentials() {
   assert(!std::strstr(json, "\"token\":"));
   char truncated[8];
   assert(config::build_json(truncated, sizeof(truncated), wifi) == 0);
-  char logs[DebugLog::kRingBytes + 1];
+  char logs[DebugLog::kFallbackRingBytes + 1];
   std::uint32_t total = 0;
   const auto count = aqlog.tail(logs, sizeof(logs) - 1, total);
   logs[count] = '\0';

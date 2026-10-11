@@ -4,7 +4,10 @@
 namespace aqlogger {
 std::size_t format_status(const StatusSnapshot &view, char *out,
                           std::size_t capacity) {
-  char utc_ms[24] = "null", clock_age[24] = "null";
+  char utc_ms[24] = "null", clock_age[24] = "null", last_disconnect[8] = "null";
+  if (view.disconnects)
+    std::snprintf(last_disconnect, sizeof(last_disconnect), "%u",
+                  unsigned(view.last_disconnect));
   if (view.utc) {
     std::snprintf(utc_ms, sizeof(utc_ms), "%lld",
                   static_cast<long long>(view.utc_ms));
@@ -15,11 +18,11 @@ std::size_t format_status(const StatusSnapshot &view, char *out,
       out, capacity,
       "{\"up_s\":%lu,\"int_s\":%lu,\"buf\":%lu,\"fin\":%lu,\"drop\":%lu,"
       "\"err\":%lu,\"miss\":%lld,\"fail\":%u,\"codec\":\"%s\",\"utc\":%u,"
-      "\"gen\":%ld,\"clk\":%ld,\"rtc\":%ld,\"sd\":%u,\"sd_state\":%u,"
+      "\"gen\":%ld,\"clk\":%u,\"rtc\":%u,\"sd\":%u,\"sd_state\":%u,"
       "\"sd_kib\":%lu,"
       "\"sd_used_kib\":%lu,\"heap\":%lu,\"part\":%lu,\"qf\":%lu,"
-      "\"qb\":%llu,\"open\":%lu,\"open_rg\":%lu,\"utc_ms\":%s,\"clk_age_s\":%"
-      "s}",
+      "\"qb\":%llu,\"open\":%lu,\"open_rg\":%lu,\"dc\":%u,\"dr\":%s,"
+      "\"utc_ms\":%s,\"clk_age_s\":%s}",
       static_cast<unsigned long>(view.uptime_seconds),
       static_cast<unsigned long>(view.interval_seconds),
       static_cast<unsigned long>(view.buffered),
@@ -29,7 +32,7 @@ std::size_t format_status(const StatusSnapshot &view, char *out,
       static_cast<long long>(view.missed), view.failed ? 1U : 0U,
       view.codec == telemetry::Codec::Lz4Raw ? "LZ4_RAW" : "UNCOMPRESSED",
       view.utc ? 1U : 0U, static_cast<long>(view.generation),
-      static_cast<long>(view.clock_source), static_cast<long>(view.rtc_state),
+      unsigned(view.clock_source), unsigned(view.rtc_state),
       view.storage_ok ? 1U : 0U, unsigned(view.sd_state),
       static_cast<unsigned long>(view.total_kib),
       static_cast<unsigned long>(view.used_kib),
@@ -38,7 +41,8 @@ std::size_t format_status(const StatusSnapshot &view, char *out,
       static_cast<unsigned long>(view.quarantined),
       static_cast<unsigned long long>(view.quarantine_bytes),
       static_cast<unsigned long>(view.open_rows),
-      static_cast<unsigned long>(view.open_groups), utc_ms, clock_age);
+      static_cast<unsigned long>(view.open_groups), unsigned(view.disconnects),
+      last_disconnect, utc_ms, clock_age);
   return written > 0 && std::size_t(written) < capacity ? std::size_t(written)
                                                         : 0;
 }
