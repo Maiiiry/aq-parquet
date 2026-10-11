@@ -1,0 +1,571 @@
+// Exercise the real BLE link policy (notify credits, the response queue, slow
+// peer close, advert flag flips, advert window, interval mode and parameter
+// validation) on the host. Run with
+// tools/test_ble_policy.py.
+#include <ble_policy.h>
+
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+
+using aqsync::EnqueueResult;
+using ble::AdvertWindow;
+using ble::CloseStart;
+using ble::ConnParams;
+using ble::FlagWatch;
+using ble::IntervalPolicy;
+using ble::NotifyCredits;
+using ble::NotifyStatus;
+using ble::Options;
+using ble::ResponseQueue;
+using ble::StallClose;
+using ble::StreamChange;
+using ble::TxSlot;
+
+namespace {
+constexpr std::int64_t kMs = 1000;
+constexpr std::int64_t kSec = 1000 * kMs;
+
+static_assert(ble::valid_options(Options{}), "default options are valid");
+static_assert(ble::valid_conn_params(Options{}.active), "default active");
+static_assert(ble::valid_conn_params(Options{}.relaxed), "default relaxed");
+
+NotifyCredits opened(std::uint32_t generation, std::int64_t now_us) {
+  NotifyCredits credits;
+  credits.configure(4, 15000);
+  credits.open(generation, now_us);
+  return credits;
+}
+
+void exhaust(NotifyCredits &credits, std::uint32_t generation,
+             std::int64_t now_us) {
+  while (credits.available())
+    assert(credits.take(generation, now_us) == EnqueueResult::Ok);
+  assert(credits.take(generation, now_us) == EnqueueResult::Full);
+}
+
+void test_credit_exhaustion() {
+  NotifyCredits credits = opened(7, 0);
+  assert(credits.capacity() == 4 && credits.available() == 4);
+  assert(credits.idle() && credits.open_for(7));
+  for (int i = 0; i < 4; ++i)
+    assert(credits.take(7, 0) == EnqueueResult::Ok);
+  assert(credits.take(7, 0) == EnqueueResult::Full);
+  assert(credits.available() == 0 && !credits.idle());
+  assert(credits.on_notify_tx(7, NotifyStatus::Sent, 1 * kMs));
+  assert(credits.available() == 1);
+  assert(credits.take(7, 2 * kMs) == EnqueueResult::Ok);
+  assert(credits.take(7, 2 * kMs) == EnqueueResult::Full);
+  // Every credit returning makes the link idle again.
+  for (int i = 0; i < 4; ++i)
+    assert(credits.on_notify_tx(7, NotifyStatus::Sent, 3 * kMs));
+  assert(credits.idle());
+  // An extra Sent never pushes past capacity.
+  assert(credits.on_notify_tx(7, NotifyStatus::Sent, 4 * kMs));
+  assert(credits.available() == 4);
+}
+
+void test_refused_and_failed() {
+  NotifyCredits credits = opened(3, 0);
+  const std::int64_t t0 = 5 * kSec;
+  exhaust(credits, 3, t0);
+  assert(credits.on_notify_tx(3, NotifyStatus::Refused, t0 + 10 * kSec));
+  assert(credits.available() == 0);
+  assert(credits.take(3, t0 + 10 * kSec) == EnqueueResult::Full);
+  // Refused is no progress, so the stall still fires 15 s after exhaustion.
+  assert(!credits.stalled(t0 + 15 * kSec - 1));
+  assert(credits.stalled(t0 + 15 * kSec));
+
+  NotifyCredits failing = opened(4, 0);
+  assert(failing.take(4, 0) == EnqueueResult::Ok);
+  assert(failing.on_notify_tx(4, NotifyStatus::Failed, 1 * kMs));
+  assert(!failing.open_for(4));
+  assert(failing.take(4, 2 * kMs) == EnqueueResult::Closed);
+  assert(!failing.stalled(100 * kSec));
+  // Events after the close belong to no open generation.
+  assert(!failing.on_notify_tx(4, NotifyStatus::Sent, 3 * kMs));
+}
+
+void test_stale_generation() {
+  NotifyCredits credits = opened(1, 0);
+  assert(credits.take(1, 0) == EnqueueResult::Ok);
+  assert(credits.available() == 3);
+  assert(!credits.on_notify_tx(2, NotifyStatus::Sent, 1 * kMs));
+  assert(!credits.on_notify_tx(2, NotifyStatus::Failed, 1 * kMs));
+  assert(credits.available() == 3 && credits.open_for(1));
+  assert(credits.take(2, 1 * kMs) == EnqueueResult::Closed);
+
+  credits.open(2, 2 * kMs);
+  assert(credits.available() == 4 && credits.open_for(2));
+  assert(!credits.open_for(1));
+  assert(credits.take(1, 3 * kMs) == EnqueueResult::Closed);
+  assert(!credits.on_notify_tx(1, NotifyStatus::Sent, 3 * kMs));
+  assert(credits.take(2, 3 * kMs) == EnqueueResult::Ok);
+  assert(credits.available() == 3);
+}
+
+void test_disconnect_while_waiting() {
+  NotifyCredits credits = opened(9, 0);
+  exhaust(credits, 9, 1 * kSec);
+  credits.close();
+  assert(!credits.open_for(9));
+  assert(credits.take(9, 2 * kSec) == EnqueueResult::Closed);
+  assert(!credits.stalled(100 * kSec));
+  assert(!credits.on_notify_tx(9, NotifyStatus::Sent, 3 * kSec));
+}
+
+void test_progress_timeout() {
+  NotifyCredits credits = opened(5, 0);
+  const std::int64_t t0 = 1 * kSec;
+  exhaust(credits, 5, t0);
+  assert(!credits.stalled(t0 + 14999 * kMs));
+  assert(credits.stalled(t0 + 15 * kSec));
+
+  // A return at t0 + 10 s moves the clock, and a take while busy does not.
+  NotifyCredits reset = opened(5, 0);
+  exhaust(reset, 5, t0);
+  assert(reset.on_notify_tx(5, NotifyStatus::Sent, t0 + 10 * kSec));
+  assert(reset.available() == 1);
+  assert(!reset.stalled(t0 + 15 * kSec));
+  assert(reset.take(5, t0 + 12 * kSec) == EnqueueResult::Ok);
+  assert(!reset.stalled(t0 + 25 * kSec - 1));
+  assert(reset.stalled(t0 + 25 * kSec));
+
+  // One frame refused forever stalls even with credits to spare.
+  NotifyCredits single = opened(8, 0);
+  assert(single.take(8, 2 * kSec) == EnqueueResult::Ok);
+  assert(single.on_notify_tx(8, NotifyStatus::Refused, 3 * kSec));
+  assert(!single.stalled(17 * kSec - 1));
+  assert(single.stalled(17 * kSec));
+
+  // A long idle spell before a burst never counts against the host.
+  NotifyCredits idle = opened(6, 0);
+  assert(!idle.stalled(60 * kSec));
+  exhaust(idle, 6, 60 * kSec);
+  assert(!idle.stalled(60 * kSec + 1 * kMs));
+  assert(!idle.stalled(75 * kSec - 1));
+  assert(idle.stalled(75 * kSec));
+
+  // Every credit home means no stall however long ago progress was.
+  NotifyCredits home = opened(8, 0);
+  assert(home.take(8, 0) == EnqueueResult::Ok);
+  assert(home.on_notify_tx(8, NotifyStatus::Sent, 1 * kSec));
+  assert(home.idle() && !home.stalled(1000 * kSec));
+  // The next burst starts a fresh clock.
+  assert(home.take(8, 1000 * kSec) == EnqueueResult::Ok);
+  assert(!home.stalled(1015 * kSec - 1));
+  assert(home.stalled(1015 * kSec));
+}
+
+void test_cancel() {
+  NotifyCredits credits = opened(2, 0);
+  assert(credits.take(2, 0) == EnqueueResult::Ok);
+  assert(credits.available() == 3);
+  credits.cancel(1);
+  assert(credits.available() == 3);
+  credits.cancel(2);
+  assert(credits.available() == 4 && credits.idle());
+  credits.cancel(2);
+  assert(credits.available() == 4);
+  exhaust(credits, 2, 1 * kSec);
+  credits.cancel(2);
+  assert(credits.available() == 1);
+  // Cancelling every credit makes the link idle, so it cannot stall.
+  credits.cancel(2);
+  credits.cancel(2);
+  credits.cancel(2);
+  assert(credits.idle() && !credits.stalled(100 * kSec));
+}
+
+void test_configure_clamps() {
+  NotifyCredits credits;
+  credits.configure(0, 15000);
+  assert(credits.capacity() == 1);
+  assert(!credits.open_for(0));
+  credits.open(1, 0);
+  assert(credits.take(1, 0) == EnqueueResult::Ok);
+  assert(credits.take(1, 0) == EnqueueResult::Full);
+  assert(credits.on_notify_tx(1, NotifyStatus::Sent, 1 * kMs));
+  assert(credits.idle());
+}
+
+void test_advert_window() {
+  AdvertWindow window;
+  assert(!window.fast(0) && window.remaining_ms(0) == 0);
+  const std::int64_t now = 100 * kSec;
+  window.extend(now, 30000);
+  assert(window.fast(now));
+  assert(window.remaining_ms(now) == 30000);
+  assert(window.fast(now + 30 * kSec - 1));
+  assert(!window.fast(now + 30 * kSec));
+  assert(window.remaining_ms(now + 30 * kSec) == 0);
+  // 0.5 ms left rounds up to 1 ms.
+  assert(window.remaining_ms(now + 29999 * kMs + 500) == 1);
+  assert(window.remaining_ms(now + 1) == 30000);
+  // A shorter window never shortens the fast spell.
+  window.extend(now + 1 * kSec, 5000);
+  assert(window.fast(now + 29 * kSec));
+  assert(window.remaining_ms(now + 10 * kSec) == 20000);
+  // A longer one extends it.
+  window.extend(now + 10 * kSec, 60000);
+  assert(window.remaining_ms(now + 10 * kSec) == 60000);
+  window.clear();
+  assert(!window.fast(now + 10 * kSec));
+  assert(window.remaining_ms(now + 10 * kSec) == 0);
+}
+
+void test_interval_policy() {
+  using Action = IntervalPolicy::Action;
+  IntervalPolicy policy;
+  std::uint32_t rearm = 99;
+  const std::int64_t t = 10 * kSec;
+  policy.connect(t);
+  assert(!policy.relaxed());
+  assert(policy.on_timer(t + 20 * kSec, 60000, rearm) == Action::None);
+  assert(rearm == 40000);
+  assert(policy.on_timer(t + 60 * kSec - 1, 60000, rearm) == Action::None);
+  assert(rearm == 1);
+  assert(policy.on_timer(t + 60 * kSec, 60000, rearm) ==
+         Action::RequestRelaxed);
+  assert(rearm == 0 && policy.relaxed());
+  rearm = 99;
+  assert(policy.on_timer(t + 61 * kSec, 60000, rearm) == Action::None);
+  assert(rearm == 0 && policy.relaxed());
+  // A response frame never wakes a relaxed link.
+  policy.on_activity(t + 62 * kSec);
+  assert(policy.relaxed());
+
+  assert(policy.on_request(t + 70 * kSec) == Action::RequestActive);
+  assert(!policy.relaxed());
+  assert(policy.on_request(t + 71 * kSec) == Action::None);
+  // Activity pushes the due time.
+  policy.on_activity(t + 100 * kSec);
+  assert(policy.on_timer(t + 131 * kSec, 60000, rearm) == Action::None);
+  assert(rearm == 29000);
+  assert(policy.on_timer(t + 160 * kSec, 60000, rearm) ==
+         Action::RequestRelaxed);
+  // A refused relax request keeps the link active, and the timer asks again.
+  policy.request_failed();
+  assert(!policy.relaxed());
+  assert(policy.on_timer(t + 161 * kSec, 60000, rearm) ==
+         Action::RequestRelaxed);
+  // A refused active request leaves it relaxed, so the next write retries.
+  assert(policy.on_request(t + 162 * kSec) == Action::RequestActive);
+  policy.request_failed();
+  assert(policy.relaxed());
+  assert(policy.on_request(t + 163 * kSec) == Action::RequestActive);
+
+  // A reconnect starts active again.
+  policy.connect(t + 200 * kSec);
+  assert(!policy.relaxed());
+  assert(policy.on_timer(t + 200 * kSec, 60000, rearm) == Action::None);
+  assert(rearm == 60000);
+}
+
+void test_conn_params() {
+  using ble::valid_conn_params;
+  assert(valid_conn_params({12, 24, 0, 400}));
+  assert(valid_conn_params({80, 160, 4, 400}));
+  assert(valid_conn_params({12, 12, 0, 400}));
+  assert(!valid_conn_params({}));
+  assert(!valid_conn_params({6, 24, 0, 400}));   // below 15 ms
+  assert(!valid_conn_params({11, 24, 0, 400}));  // below 15 ms
+  assert(!valid_conn_params({24, 12, 0, 400}));  // max below min
+  assert(!valid_conn_params({12, 20, 0, 400}));  // max not 15 ms above min
+  assert(!valid_conn_params({12, 23, 0, 400}));  // one unit short
+  assert(!valid_conn_params({16, 16, 0, 400}));  // equal only at 15 ms
+  assert(valid_conn_params({12, 24, 30, 400}));  // latency limit
+  assert(!valid_conn_params({12, 24, 31, 400})); // latency over 30
+  assert(valid_conn_params({12, 24, 0, 200}));   // 2 s timeout
+  assert(valid_conn_params({12, 24, 0, 600}));   // 6 s timeout
+  assert(!valid_conn_params({12, 24, 0, 100}));  // 1 s timeout
+  assert(!valid_conn_params({12, 24, 0, 199}));
+  assert(!valid_conn_params({12, 24, 0, 601}));
+  assert(!valid_conn_params({12, 24, 0, 700})); // 7 s timeout
+  // 200 ms times 10 is exactly 2 s effective, but a 6 s timeout is not over
+  // three effective intervals.
+  assert(!valid_conn_params({80, 160, 9, 600}));
+  // 200 ms times 11 is a 2.2 s effective interval. Any effective interval
+  // above 2 s also fails the timeout rule, since the timeout is at most 6 s.
+  assert(!valid_conn_params({80, 160, 10, 600}));
+  assert(!valid_conn_params({800, 1600, 0, 600}));  // 2 s, 6 s not over 3x
+  assert(!valid_conn_params({1600, 3200, 0, 600})); // 4 s interval
+  // 200 ms times 5 is 1 s effective, so the timeout must exceed 3 s.
+  assert(!valid_conn_params({80, 160, 4, 300}));
+  assert(valid_conn_params({80, 160, 4, 301}));
+  // 200 ms times 8 is 1.6 s effective, so 4.8 s is not enough.
+  assert(!valid_conn_params({80, 160, 7, 480}));
+  assert(valid_conn_params({80, 160, 7, 481}));
+}
+
+void test_options() {
+  assert(ble::valid_options(Options{}));
+  Options o;
+  o.notify_credits = 0;
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.wait_step_ms = o.progress_timeout_ms;
+  assert(!ble::valid_options(o));
+  o.wait_step_ms = o.progress_timeout_ms + 1;
+  assert(!ble::valid_options(o));
+  o.wait_step_ms = o.progress_timeout_ms - 1;
+  assert(ble::valid_options(o));
+  o = Options{};
+  o.wait_step_ms = 0;
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.refused_retry_ms = 0;
+  assert(!ble::valid_options(o));
+  o.refused_retry_ms = o.progress_timeout_ms;
+  assert(!ble::valid_options(o));
+  o.refused_retry_ms = o.progress_timeout_ms - 1;
+  assert(ble::valid_options(o));
+  o = Options{};
+  o.progress_timeout_ms = 0;
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.data_len_octets = 252;
+  assert(!ble::valid_options(o));
+  o.data_len_octets = 27;
+  assert(ble::valid_options(o));
+  o.data_len_octets = 26;
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.active = {12, 20, 0, 400};
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.relaxed = {80, 160, 10, 600};
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.fast_adv_min = 31;
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.slow_adv_max = 16385;
+  assert(!ble::valid_options(o));
+  o = Options{};
+  o.notify_credits = ble::kMaxNotifyCredits;
+  assert(ble::valid_options(o));
+  o.notify_credits = ble::kMaxNotifyCredits + 1;
+  assert(!ble::valid_options(o));
+}
+
+ResponseQueue queue_for(std::uint32_t generation, std::uint8_t slots = 4) {
+  ResponseQueue queue;
+  queue.configure(slots, 15000);
+  queue.open(generation, 0);
+  return queue;
+}
+
+// Reserves and publishes one frame whose length tags it.
+void push(ResponseQueue &queue, std::uint32_t generation, std::uint16_t tag) {
+  const auto r = queue.reserve(generation, 0);
+  assert(r.result == EnqueueResult::Ok);
+  assert(queue.publish(r, generation, tag, 7));
+}
+
+std::uint16_t pop(ResponseQueue &queue, std::uint32_t generation) {
+  TxSlot slot;
+  std::uint8_t index = 0;
+  assert(queue.front(slot, index));
+  assert(slot.session == generation && slot.handle == 7);
+  const auto outcome = queue.on_notify_tx(generation, NotifyStatus::Sent, 0);
+  assert(outcome.current && !outcome.stalled);
+  return slot.length;
+}
+
+void test_queue_order_and_wrap() {
+  auto queue = queue_for(1, 3);
+  TxSlot slot;
+  std::uint8_t index = 0;
+  assert(!queue.front(slot, index) && queue.idle());
+  std::uint16_t next = 1, expect = 1;
+  // Ten frames through three slots, never more than three in flight, come out
+  // in order across every wrap.
+  for (int round = 0; round < 4; ++round) {
+    while (queue.queued() < 3 && next <= 10)
+      push(queue, 1, next++);
+    if (next <= 10)
+      assert(queue.reserve(1, 0).result == EnqueueResult::Full);
+    while (queue.queued())
+      assert(pop(queue, 1) == expect++);
+  }
+  assert(expect == 11 && queue.idle());
+}
+
+// The review's race: a frame is reserved while two are queued, the stream
+// closes and reopens for the same generation while the bytes are copied, and
+// the late publish must not land in the new ring.
+void test_reopen_same_generation_rejects_late_publish() {
+  auto queue = queue_for(5, 3);
+  push(queue, 5, 1);
+  push(queue, 5, 2);
+  const auto late = queue.reserve(5, 0);
+  assert(late.result == EnqueueResult::Ok && late.slot == 2);
+  const auto before = queue.epoch();
+  queue.close();
+  assert(queue.epoch() != before);
+  queue.open(5, 0);
+  assert(queue.open_for(5) && queue.idle());
+  assert(!queue.publish(late, 5, 3, 7));
+  TxSlot slot;
+  std::uint8_t index = 0;
+  assert(!queue.front(slot, index));
+  // The new stream starts at slot 0 and keeps its own order.
+  push(queue, 5, 10);
+  assert(queue.front(slot, index) && index == 0 && slot.length == 10);
+  assert(pop(queue, 5) == 10 && queue.idle());
+}
+
+void test_close_rejects_publish() {
+  auto queue = queue_for(2);
+  const auto r = queue.reserve(2, 0);
+  queue.close();
+  assert(!queue.publish(r, 2, 1, 7));
+  assert(queue.reserve(2, 0).result == EnqueueResult::Closed);
+  // A reservation for one generation never publishes into another.
+  queue.open(3, 0);
+  const auto other = queue.reserve(3, 0);
+  assert(!queue.publish(other, 2, 1, 7));
+  assert(queue.publish(other, 3, 1, 7));
+}
+
+void test_queue_refused_failed_and_foreign() {
+  auto queue = queue_for(4);
+  push(queue, 4, 1);
+  push(queue, 4, 2);
+  auto outcome = queue.on_notify_tx(4, NotifyStatus::Refused, 1 * kSec);
+  assert(outcome.current && !outcome.stalled && queue.queued() == 2);
+  // Refused until the progress timeout marks the stream stalled.
+  outcome = queue.on_notify_tx(4, NotifyStatus::Refused, 15 * kSec);
+  assert(outcome.current && outcome.stalled && queue.queued() == 2);
+  // A frame of an older generation clears without touching credits.
+  const auto epoch = queue.epoch();
+  outcome = queue.on_notify_tx(3, NotifyStatus::Sent, 15 * kSec);
+  assert(!outcome.current && queue.queued() == 0 && queue.epoch() != epoch);
+  queue.open(4, 16 * kSec);
+  push(queue, 4, 1);
+  outcome = queue.on_notify_tx(4, NotifyStatus::Failed, 16 * kSec);
+  assert(outcome.current && !outcome.stalled && queue.queued() == 0);
+  assert(!queue.open_for(4));
+  assert(queue.reserve(4, 0).result == EnqueueResult::Closed);
+}
+
+void test_configure_caps_slots() {
+  ResponseQueue queue;
+  queue.configure(200, 15000);
+  assert(queue.capacity() == ble::kMaxNotifyCredits);
+  queue.open(1, 0);
+  for (int i = 0; i < ble::kMaxNotifyCredits; ++i)
+    push(queue, 1, static_cast<std::uint16_t>(i + 1));
+  assert(queue.reserve(1, 0).result == EnqueueResult::Full);
+}
+
+void test_response_subscribe() {
+  using ble::response_subscribe;
+  // The first subscribe after connect finds the stream already open.
+  static_assert(response_subscribe(true, false, true) == StreamChange::None,
+                "first subscribe");
+  static_assert(response_subscribe(false, false, true) == StreamChange::Close,
+                "unsubscribe closes at once");
+  static_assert(response_subscribe(false, false, false) == StreamChange::Close,
+                "a second unsubscribe is harmless");
+  static_assert(response_subscribe(true, false, false) == StreamChange::Reopen,
+                "resubscribe opens a new generation");
+  static_assert(response_subscribe(false, true, true) == StreamChange::None,
+                "disconnect leaves it to DISCONNECT");
+  static_assert(response_subscribe(true, true, false) == StreamChange::None,
+                "disconnect never reopens");
+  // Unsubscribe, resubscribe: the late frame of the old stream cannot land.
+  std::uint32_t generation = 8;
+  auto queue = queue_for(generation);
+  push(queue, generation, 1);
+  const auto late = queue.reserve(generation, 0);
+  assert(response_subscribe(false, false, queue.open_for(generation)) ==
+         StreamChange::Close);
+  queue.close();
+  assert(response_subscribe(true, false, queue.open_for(generation)) ==
+         StreamChange::Reopen);
+  queue.open(++generation, 0);
+  assert(!queue.publish(late, generation - 1, 2, 7));
+  assert(!queue.publish(late, generation, 2, 7));
+  assert(queue.reserve(generation - 1, 0).result == EnqueueResult::Closed);
+  assert(queue.idle());
+}
+
+void test_classify_close() {
+  constexpr int kAlready = 2; // BLE_HS_EALREADY
+  static_assert(ble::classify_close(0, kAlready) == CloseStart::Started, "");
+  static_assert(ble::classify_close(kAlready, kAlready) ==
+                    CloseStart::AlreadyClosing,
+                "");
+  static_assert(ble::classify_close(7, kAlready) == CloseStart::Failed, "");
+}
+
+void test_stall_close() {
+  StallClose stall;
+  // Not stalled: retry, nothing logged.
+  assert(stall.on_refused(3, false) == StallClose::Action::Retry);
+  // Stalled while a reboot terminate is pending: EALREADY ends the retries
+  // and the stall is logged a single time.
+  assert(stall.on_refused(3, true) == StallClose::Action::Close);
+  assert(stall.log(3));
+  assert(stall.on_close(3, CloseStart::AlreadyClosing) ==
+         StallClose::Action::Wait);
+  for (int i = 0; i < 100; ++i) {
+    assert(stall.on_refused(3, true) == StallClose::Action::Wait);
+    assert(!stall.log(3));
+  }
+  // A failed terminate keeps retrying but never logs twice.
+  assert(stall.on_refused(4, true) == StallClose::Action::Close);
+  assert(stall.log(4));
+  assert(stall.on_close(4, CloseStart::Failed) == StallClose::Action::Retry);
+  assert(stall.on_refused(4, true) == StallClose::Action::Close);
+  assert(!stall.log(4));
+  assert(stall.on_close(4, CloseStart::Started) == StallClose::Action::Wait);
+  assert(stall.on_refused(4, true) == StallClose::Action::Wait);
+  // A new session is judged afresh.
+  assert(stall.on_refused(5, true) == StallClose::Action::Close);
+  assert(stall.log(5));
+}
+
+void test_flag_watch() {
+  FlagWatch watch;
+  // Boot: the placeholder was applied at sync without a publish; the first
+  // publish (SD present, no UTC) only sets the baseline.
+  assert(!watch.on_publish(0x05));
+  assert(!watch.on_publish(0x05));
+  // A real flip, then back.
+  assert(watch.on_publish(0x04));
+  assert(watch.on_publish(0x05));
+  assert(!watch.on_publish(0x05));
+  // A first publish equal to the placeholder is no flip either.
+  FlagWatch same;
+  assert(!same.on_publish(0x01));
+  assert(same.on_publish(0x03));
+}
+} // namespace
+
+int main() {
+  test_credit_exhaustion();
+  test_refused_and_failed();
+  test_stale_generation();
+  test_disconnect_while_waiting();
+  test_progress_timeout();
+  test_cancel();
+  test_configure_clamps();
+  test_advert_window();
+  test_interval_policy();
+  test_conn_params();
+  test_options();
+  test_queue_order_and_wrap();
+  test_reopen_same_generation_rejects_late_publish();
+  test_close_rejects_publish();
+  test_queue_refused_failed_and_foreign();
+  test_configure_caps_slots();
+  test_response_subscribe();
+  test_classify_close();
+  test_stall_close();
+  test_flag_watch();
+  std::printf("ble policy passed\n");
+  return 0;
+}
