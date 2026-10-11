@@ -1,4 +1,5 @@
 #include "ble_sync.h"
+#include "abort_signal.h"
 #include "ble_advert.h"
 #include "debug_log.h"
 #include "disconnect.h"
@@ -63,6 +64,7 @@ std::atomic<std::int64_t> pairing_deadline{0};
 // Why this side asked the controller to terminate. The controller reports a
 // local termination as HCI 0x16, which carries no reason of its own.
 std::atomic<DisconnectReason> pending_reason{DisconnectReason::Unknown};
+CloseClaim close_claim;
 
 // A failed terminate leaves no stale reason to mislabel the next connection.
 void terminate(std::uint16_t handle, DisconnectReason reason) {
@@ -321,8 +323,12 @@ int access(std::uint16_t handle, std::uint16_t, ble_gatt_access_ctxt *ctxt,
   aqlog.record_only().printf("BLE CMD op=0x%02x bytes=%u\n",
                              unsigned(request.bytes[0]),
                              unsigned(request.length));
-  if (!request_handler(request) &&
-      !defer_error(static_cast<Op>(request.bytes[0]), kErrBusy, "queue-full",
+  aqsync::abort::stamp(request);
+  if (request_handler(request)) {
+    aqsync::abort::commit(request);
+    return 0;
+  }
+  if (!defer_error(static_cast<Op>(request.bytes[0]), kErrBusy, "queue-full",
                    request.link_generation))
     return BLE_ATT_ERR_INSUFFICIENT_RES;
   return 0;
@@ -358,8 +364,9 @@ int gap_event(ble_gap_event *event, void *) {
         map_ble_disconnect(event->disconnect.reason, local, err);
     const int hci = event->disconnect.reason - BLE_HS_ERR_HCI_BASE;
     // Record before clearing `connected`: disconnect() callers wait on it.
-    record_disconnect(reason, kEventLinkBle, closed, err, 0,
-                      esp_timer_get_time());
+    if (close_claim.claim(closed))
+      record_disconnect(reason, kEventLinkBle, closed, err, 0,
+                        esp_timer_get_time());
     connected = false;
     authenticated = false;
     pairing_active = false;
@@ -642,6 +649,19 @@ void disconnect(DisconnectReason reason) {
   const auto handle = conn_handle.load();
   if (connected.load() && handle != BLE_HS_CONN_HANDLE_NONE)
     terminate(handle, reason);
+}
+
+void disconnect_and_wait(DisconnectReason reason, std::uint32_t timeout_ms) {
+  disconnect(reason);
+  for (std::uint32_t waited = 0; waited < timeout_ms && connected.load();
+       waited += 10)
+    vTaskDelay(pdMS_TO_TICKS(10));
+  // The callback clears `connected` before the generation moves on, so a link
+  // still up here is the one that was asked to close.
+  const std::uint32_t closed = generation.load();
+  if (connected.load() && close_claim.claim(closed))
+    record_disconnect(reason, kEventLinkBle, closed, 0, 0,
+                      esp_timer_get_time());
 }
 
 void clear_bonds() {

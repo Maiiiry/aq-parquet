@@ -1,6 +1,6 @@
 #pragma once
 
-// Bluetooth LE sync service, protocol v2: docs/shared/ble-sync-protocol.md.
+// Bluetooth LE sync service, protocol v3: docs/shared/ble-sync-protocol.md.
 //
 // Threading contract. NimBLE callbacks run on the host task and never touch the
 // SD card or the display. `control` writes become ControlRequest values that
@@ -15,7 +15,7 @@
 #include <cstdint>
 
 namespace ble {
-constexpr std::uint8_t kProtocolVersion = 2;
+constexpr std::uint8_t kProtocolVersion = 3;
 constexpr std::size_t kMaxControlBytes = 512;
 constexpr std::uint8_t kMaxLanClients = 3;
 constexpr std::uint32_t kMaxRead = 16384;
@@ -129,6 +129,8 @@ struct ControlRequest {
   Link link = Link::Ble;
   std::uint8_t peer = 0; // LAN slot; BLE always uses zero
   std::uint32_t link_generation = 0;
+  // The link's ABORT sequence when this request arrived (abort_signal.h).
+  std::uint32_t abort_seq = 0;
 };
 
 using RequestHandler = bool (*)(const ControlRequest &request);
@@ -173,6 +175,9 @@ void clear_bonds();
 // from any task; a no-op without a connection. link().connected turns false
 // only after the event is recorded.
 void disconnect(DisconnectReason reason);
+// disconnect(), then waits up to timeout_ms for the close. On timeout the
+// event is recorded here so a restart that follows still leaves it.
+void disconnect_and_wait(DisconnectReason reason, std::uint32_t timeout_ms);
 
 // From the sampling loop, after the row was queued. Payloads <= kMaxJson.
 // Cache the complete value; omit notifications exceeding negotiated MTU - 3.
