@@ -311,7 +311,11 @@ the backup gate against `backup/waveshare-sim7670g-v2-flash-20260927T222602Z.bin
 esptool verified all written regions and NVS was kept. In the first minutes of
 the after-fix capture the iPad reconnected and bonded
 (`BLE CONNECT`, `BLE BONDED authenticated=true bonds=3`, `BLE MTU mtu=517`,
-host time accepted) with no assert or panic. This is one reconnect, so repeated
-app reopen cycles, a full iPad archive transfer on the new image and endurance
-are not established by this entry. Logs are in ignored
+host time accepted) with no assert or panic. The full 1800 s capture then
+showed that single connection held with no disconnect, no assert, no panic and
+no reconnect loop, while logging continued (two Parquet files of 27 and 68 rows
+became ready, row 179 at 1800 s, `dropped=0`). This is one reconnect and one
+idle bonded link, so repeated app reopen cycles and a full iPad archive
+transfer on the new image are not established by this entry. The CoreS3 has
+not received this image yet. Logs are in ignored
 `firmware/esp-idf-waveshare-sim7670g/artifacts/ble-ipad-20261012/`.
