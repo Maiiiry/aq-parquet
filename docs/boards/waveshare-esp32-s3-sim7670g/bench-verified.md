@@ -236,3 +236,82 @@ byte count and digest were not separately measured on the phone; the app's
 verified indicator is its size/CRC/PAR1 check. Full archive, low-MTU phone,
 LAN, screen-off and multi-device transfers remain unmeasured here. The board
 still had no UTC anchor, so new rows stayed untimed.
+
+
+## 2026-10-11 — main 7384e03 native logger USB reflash and readback
+
+Waveshare V2.0 MAC `a4:cb:8f:d7:75:00`, checked CH343 port
+`/dev/cu.wchusbserial5B901533371`. In order, ports/chip/flash-ID/eFuse checks
+confirmed ESP32-S3 rev0.2, 8 MB embedded PSRAM, 16 MB quad flash and an
+available download path with secure boot and flash encryption disabled. The
+existing board backup `backup/waveshare-sim7670g-v2-flash-20260927T222602Z.bin`
+was reverified at 16,777,216 bytes and SHA-256
+`d88ddcd6bbbc69972396df9a1d67d75b006f5058d000e07cd850717fffd07a45`.
+A fresh default-speed CH343 backup was not taken; the recorded full read takes
+about 25 minutes.
+
+Pulled `main` at `7384e03`, regenerated the disposable build sdkconfig from
+current defaults after the earlier generated FAT lock limit failed compilation,
+and built the native logger through `pixi run waveshare-build`. The checked
+v2.5 app BIN SHA-256 is
+`e8bb3a1cd3b6f74fdf207f274f9053d90d0f28f755d504ae4b5545b01bc1a193`.
+Buffered samples were flushed before the backup-gated flash wrapper; esptool
+verified all written regions. NVS was outside the flash plan, no card format or
+archive erase was performed, and the observed station ID stayed unchanged.
+Images, configuration, build/flash logs, status and reader evidence are retained
+in ignored `firmware/esp-idf-waveshare-sim7670g/artifacts/reflash-20261011/`.
+Only the generated dependency-lock manifest hash was normalized by the build;
+pinned dependency versions/source identities were unchanged, and the tracked
+lock was restored after retaining the generated copy in artifacts.
+
+A manual-flush USB export contained five rows, 56 columns and one row group,
+10,735 bytes, CRC32 `058e4136`, SHA-256
+`f20df0d7cb272740960d2469686b271c8479559d79b83fdee024f9cdfde649a1`.
+Transfer integrity passed and PyArrow/DuckDB agreed. Sequence 0–4 was complete,
+with exactly 10,000,000 us between acquisition timestamps. Drops, storage errors
+and missed deadlines were zero. PMS warm-up nulls preceded checksum-valid
+frames; gauge status was valid, at 4,275–4,276 mV and capped 100%. Ambient
+readings of 0.4–1.0 C and RH 0–0.1% were implausible for the bench and are
+recorded as a measurement limitation, not qualified environmental values.
+Stored clock status was host estimate (1); the bench helper did not set time,
+the external anchor source was not investigated. This short native
+logging/USB readback does not qualify environmental accuracy, battery accuracy,
+phone reconnect/transfer, BLE/LAN load, full-window rotation, endurance or
+power-cut durability. Both board builds, format/lint and 18 additional relevant
+host gates passed before flashing; gate logs are retained with CoreS3 artifacts.
+
+
+## iPad bonded reconnect, controller assert and link sequencing (2026-10-12)
+
+Symptom. With phone Wi-Fi off, the iPad synced 1391 files over BLE, then the
+link dropped. The passive capture of the next reconnect showed
+`BLE BONDED authenticated=true bonds=3`, then
+`BLE assert lld_con.c 3275, param 00000002 00000000` and
+`Guru Meditation Error: Core 0 panic'ed (Interrupt wdt timeout on CPU0)`, and
+the next boot reported `boot_seq=3 reset=5`. The backtrace, symbolized with the
+matching `artifacts/reflash-20261011/aq_waveshare.elf`, stays inside the closed
+ESP32-S3 controller (`r_llc_loc_con_upd_proc_continue_hack`,
+`ll_connection_update_ind_handler_hack`, `r_lld_llcp_rx_ind_handler_hack`,
+`rw_schedule`, `btdm_rw_run`). The controller asserted when the central's
+connection update arrived while a local link procedure was still open. At
+connect, before encryption, the firmware requested data length, 2M PHY and an
+active connection interval together.
+
+Fix (shared `ble_sync.cpp`, both boards). Connect requests only the data length
+change, which has no instant. After encryption succeeds the firmware waits 2 s,
+requests 2M PHY, and waits for PHY completion or a 2 s fallback. Only then does
+it request the active interval, and only when the central has not already chosen
+one in range. A refused request is retried after 1 s, and the idle relax step
+waits until the sequence is done. `docs/shared/ble-sync-protocol.md` describes
+the new order. Frame layouts, opcodes and UUIDs are unchanged. Host format,
+lint, BLE policy tests and both board builds passed.
+
+Buffered rows were flushed with `parquet flush`, then the image was flashed with
+the backup gate against `backup/waveshare-sim7670g-v2-flash-20260927T222602Z.bin`.
+esptool verified all written regions and NVS was kept. In the first minutes of
+the after-fix capture the iPad reconnected and bonded
+(`BLE CONNECT`, `BLE BONDED authenticated=true bonds=3`, `BLE MTU mtu=517`,
+host time accepted) with no assert or panic. This is one reconnect, so repeated
+app reopen cycles, a full iPad archive transfer on the new image and endurance
+are not established by this entry. Logs are in ignored
+`firmware/esp-idf-waveshare-sim7670g/artifacts/ble-ipad-20261012/`.

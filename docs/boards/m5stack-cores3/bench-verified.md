@@ -811,3 +811,61 @@ ELF/manifest, flash/reset logs and fresh boot capture. Limits: these checks
 establish erase, deployment, clean boot and host clock acceptance. Full-window
 rotation after the fix, bonded phone reconnect/transfer, endurance and power-cut
 durability are not established by this entry.
+
+
+## 2026-10-11 — main 7384e03 USB reflash and bounded readback
+
+CoreS3 MAC `44:1b:f6:e2:6b:40`, checked native USB port
+`/dev/cu.usbmodem112301`. In order, ports/chip/flash-ID/eFuse checks confirmed
+ESP32-S3 rev0.2, 16 MB quad flash and an available download path with secure
+boot and flash encryption disabled. A fresh full backup,
+`backup/m5stack-cores3-flash-20261011T084924Z.bin`, is 16,777,216 bytes,
+SHA-256 `0b3a8c4aa0e36b96c0d9d620e5027cdc7575bcde0a6e2eaff4537a5c4abe19e5`.
+
+Pulled `main` at `7384e03`, regenerated the disposable build sdkconfig from
+current defaults after the earlier generated FAT lock limit failed compilation,
+and built through `pixi run cores3-build`. The checked v6.11 app BIN SHA-256 is
+`7e25d7148d36d550f6791c217c67878f61df58176f6e21cab60c3c03016ba40f`.
+Buffered samples were flushed before the backup-gated flash wrapper; esptool
+verified all written regions. NVS was outside the flash plan, no card format or
+archive erase was performed, and the observed station ID stayed unchanged.
+Images, build/flash logs, configuration, status and reader evidence are retained
+in ignored `firmware/esp-idf-cores3/artifacts/reflash-20261011/`.
+
+A manual-flush USB export contained six rows, 81 columns and one row group,
+13,657 bytes, CRC32 `20d77efb`, SHA-256
+`85d6b25458bf36608f46b4edc704a32e38c53494598c7b9fe376fa6c0d6c649b`.
+Transfer integrity passed and PyArrow/DuckDB agreed. Sequence 0–5 was complete;
+intervals were 9,998,103–10,003,014 us. Drops, storage errors and missed
+sampling deadlines were zero. PMS warm-up nulls preceded valid frames; light
+and proximity status were valid. Stored clock status was network SNTP (3).
+Battery voltage readings were implausible and variable (5–2,140 mV), with 0%
+reported; battery measurement accuracy is not established by this run.
+This is a short USB logging/readback check; phone reconnect/transfer, LAN load,
+display behavior, full-window rotation, endurance and power-cut durability were
+not tested. Host format/lint and 18 additional relevant sanitizer/contract gates
+passed before flashing; their logs are in the same artifact directory.
+
+
+## iOS bonded reconnect reboot, NimBLE host stack (2026-10-12)
+
+Symptom. Android synced normally, but an iPad reconnect rebooted the CoreS3.
+The serial capture showed `BLE BONDED authenticated=true bonds=3`, then
+`A stack overflow in task nimble_host has been detected.`, and the next boot
+reported `reset=panic(4)`. The host task ran on the 4096 byte NimBLE default
+while it built JSON snapshots and parsed control requests on its stack.
+
+Fix (`1f2778c`, on main). `tools/idf-connectivity-sdkconfig.defaults` sets
+`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192`, and `ble_sync.cpp` keeps the
+snapshot JSON buffer and the control request in static storage instead of host
+task locals. Stale `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` lines were removed
+from the disposable build sdkconfig files so the rebuild picked up 8192.
+Flashed with the backup gate against
+`backup/m5stack-cores3-flash-20261011T084924Z.bin`, NVS kept.
+
+After the flash, three iPad connects (two bonded) completed with no panic, and
+`DIAG tasks` reported `nimble_host=4736` bytes free at 62 s uptime. The capture
+ends at about 112 s because the board was unplugged, so endurance and a full
+iPad transfer on this board are not established. The BLE link sequencing change
+recorded for the Waveshare on the same date is not flashed to this board yet.
+Logs are in ignored `firmware/esp-idf-cores3/artifacts/ble-reboot-20261012/`.

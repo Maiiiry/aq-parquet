@@ -119,8 +119,11 @@ FlagWatch flag_watch; // host task only
 std::atomic<bool> advert_published{false};
 ble_npl_callout retry_callout{}, relax_callout{}, advertise_callout{},
     link_callout{};
-AdvertWindow adv_window; // host task only
-IntervalPolicy interval; // host task only
+// Where the post-connect link sequence is, see link_on_host().
+enum class LinkStep : std::uint8_t { Idle, Phy, Interval, Done };
+LinkStep link_step = LinkStep::Idle; // host task only
+AdvertWindow adv_window;             // host task only
+IntervalPolicy interval;             // host task only
 std::atomic<bool> adv_fast{false};
 std::atomic<unsigned> pending_snapshots{0};
 std::atomic<bool> startup_ok{false}, host_requested{false};
@@ -432,6 +435,10 @@ int request_conn_params(std::uint16_t handle, const ConnParams &p,
 void relax_on_host(ble_npl_event *) {
   if (!connected.load())
     return;
+  if (link_step != LinkStep::Done) {
+    ble_npl_callout_reset(&relax_callout, ble_npl_time_ms_to_ticks32(1000));
+    return;
+  }
   std::uint32_t rearm_ms = 0;
   const auto action =
       interval.on_timer(esp_timer_get_time(), options.relax_after_ms, rearm_ms);
@@ -446,29 +453,73 @@ void relax_on_host(ble_npl_event *) {
     ble_npl_callout_reset(&relax_callout, ble_npl_time_ms_to_ticks32(rearm_ms));
 }
 
-// The active interval request at connect. A procedure in progress refuses it,
-// so it is tried again every second while the link stays up and active.
-void request_active_on_host(ble_npl_event *) {
-  if (!connected.load() || interval.relaxed())
+// Link procedures after connect run one at a time. PHY update and
+// connection update both carry an instant, and the ESP32-S3 controller
+// asserted in its local connection update (lld_con.c 3275) when an iPad's
+// own CONNECTION_UPDATE_IND crossed ours during the bonded reconnect
+// (bench 2026-10-12). Data length has no instant, so it goes at connect.
+// PHY waits for encryption to settle, the interval waits for the PHY.
+constexpr std::uint32_t kLinkSettleMs = 2000;
+constexpr std::uint32_t kPhyWaitMs = 2000;
+
+bool interval_already_active(std::uint16_t handle) {
+  ble_gap_conn_desc desc{};
+  return ble_gap_conn_find(handle, &desc) == 0 &&
+         desc.conn_itvl >= options.active.itvl_min &&
+         desc.conn_itvl <= options.active.itvl_max &&
+         desc.conn_latency == options.active.latency;
+}
+
+void link_on_host(ble_npl_event *) {
+  if (!connected.load() || !authenticated.load())
     return;
-  if (request_conn_params(conn_handle.load(), options.active, "active") != 0)
+  const auto handle = conn_handle.load();
+  if (link_step == LinkStep::Phy) {
+    link_step = LinkStep::Interval;
+    if (options.prefer_2m_phy) {
+      const int rc = ble_gap_set_prefered_le_phy(handle, BLE_GAP_LE_PHY_2M_MASK,
+                                                 BLE_GAP_LE_PHY_2M_MASK,
+                                                 BLE_GAP_LE_PHY_CODED_ANY);
+      aqlog.record_only().printf("BLE LINK request phy=2m rc=%d\n", rc);
+      if (rc == 0) {
+        // PHY_UPDATE_COMPLETE moves on sooner; this is the fallback.
+        ble_npl_callout_reset(&link_callout,
+                              ble_npl_time_ms_to_ticks32(kPhyWaitMs));
+        return;
+      }
+    }
+  }
+  if (link_step != LinkStep::Interval)
+    return;
+  // The central often picks an interval in range on its own. Asking anyway
+  // only starts a procedure that can cross the central's next update.
+  if (interval.relaxed() || interval_already_active(handle)) {
+    link_step = LinkStep::Done;
+    return;
+  }
+  // A procedure in progress refuses it, so it is tried again every second.
+  if (request_conn_params(handle, options.active, "active") != 0)
     ble_npl_callout_reset(&link_callout, ble_npl_time_ms_to_ticks32(1000));
+  else
+    link_step = LinkStep::Done;
 }
 
 void request_link_parameters(std::uint16_t handle) {
+  link_step = LinkStep::Idle;
   const int dle = ble_gap_set_data_len(handle, options.data_len_octets,
                                        options.data_len_time_us);
-  int phy = 0;
-  if (options.prefer_2m_phy)
-    phy = ble_gap_set_prefered_le_phy(handle, BLE_GAP_LE_PHY_2M_MASK,
-                                      BLE_GAP_LE_PHY_2M_MASK,
-                                      BLE_GAP_LE_PHY_CODED_ANY);
-  aqlog.record_only().printf("BLE LINK request dle=%u/%u rc=%d phy=%s rc=%d\n",
+  aqlog.record_only().printf("BLE LINK request dle=%u/%u rc=%d\n",
                              unsigned(options.data_len_octets),
-                             unsigned(options.data_len_time_us), dle,
-                             options.prefer_2m_phy ? "2m" : "default", phy);
-  if (request_conn_params(handle, options.active, "active") != 0)
-    ble_npl_callout_reset(&link_callout, ble_npl_time_ms_to_ticks32(1000));
+                             unsigned(options.data_len_time_us), dle);
+}
+
+// Called once the link is encrypted and authenticated.
+void start_link_sequence() {
+  if (link_step != LinkStep::Idle)
+    return;
+  link_step = LinkStep::Phy;
+  ble_npl_callout_reset(&link_callout,
+                        ble_npl_time_ms_to_ticks32(kLinkSettleMs));
 }
 
 bool defer_error(Op op, Error code, const char *detail, std::uint32_t session) {
@@ -672,6 +723,7 @@ int gap_event(ble_gap_event *event, void *) {
     } else {
       aqlog.printf("BLE BONDED authenticated=true bonds=%lu\n",
                    static_cast<unsigned long>(bonds.load()));
+      start_link_sequence();
     }
     return 0;
   case BLE_GAP_EVENT_PASSKEY_ACTION: {
@@ -726,6 +778,9 @@ int gap_event(ble_gap_event *event, void *) {
     return 0;
   }
   case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+    if (event->phy_updated.conn_handle == conn_handle.load() &&
+        link_step == LinkStep::Interval)
+      ble_npl_callout_reset(&link_callout, ble_npl_time_ms_to_ticks32(200));
     if (event->phy_updated.conn_handle == conn_handle.load())
       aqlog.record_only().printf("BLE PHY tx=%u rx=%u status=%d\n",
                                  unsigned(event->phy_updated.tx_phy),
@@ -931,7 +986,7 @@ bool begin(const Identity &identity, config::PairMode pairing_mode,
   ble_npl_callout_init(&advertise_callout, nimble_port_get_dflt_eventq(),
                        advertise_on_host, nullptr);
   ble_npl_callout_init(&link_callout, nimble_port_get_dflt_eventq(),
-                       request_active_on_host, nullptr);
+                       link_on_host, nullptr);
   if (xTaskCreate(error_task, "aq_ble_error", 3072, nullptr, 4, nullptr) !=
       pdPASS)
     return false;
