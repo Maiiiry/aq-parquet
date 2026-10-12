@@ -283,6 +283,12 @@ bool responses_idle() {
   return idle;
 }
 
+// Scratch for the NimBLE host task only (snapshot notifications and GATT
+// access callbacks both run there, one at a time). Kept off its 8 KB stack,
+// which the ATT, SM and NVS bond paths below these callbacks already use.
+char host_json[kMaxJson];
+ControlRequest host_request;
+
 void notify_snapshots(ble_npl_event *) {
   // Snapshots never slip between the frames of a response stream and never
   // compete with it for host buffers; the pending bits wait for idle credits.
@@ -292,7 +298,7 @@ void notify_snapshots(ble_npl_event *) {
   for (const auto which : {Status, Live}) {
     if (!(pending & (1U << which)))
       continue;
-    char value[kMaxJson];
+    char *const value = host_json;
     portENTER_CRITICAL(&snapshot_lock);
     const auto length = which == Status ? status_length : live_length;
     std::memcpy(value, which == Status ? status_text : live_text, length);
@@ -495,7 +501,7 @@ int access(std::uint16_t handle, std::uint16_t, ble_gatt_access_ctxt *ctxt,
     if (which == Status || which == Live) {
       // ATT performs Read Blob offset slicing after the callback. Append the
       // full cached snapshot, including values too large for notifications.
-      char value[kMaxJson];
+      char *const value = host_json;
       portENTER_CRITICAL(&snapshot_lock);
       const auto length = which == Status ? status_length : live_length;
       std::memcpy(value, which == Status ? status_text : live_text, length);
@@ -508,7 +514,8 @@ int access(std::uint16_t handle, std::uint16_t, ble_gatt_access_ctxt *ctxt,
   }
   if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR || which != Control)
     return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
-  ControlRequest request;
+  ControlRequest &request = host_request;
+  request = ControlRequest{};
   request.received_mono_us = esp_timer_get_time();
   request.conn_handle = handle;
   request.link_generation = generation.load();
