@@ -22,7 +22,7 @@ cppcheck "${options[@]}" \
   firmware/esp-idf-waveshare-sim7670g/board_io.cpp \
   firmware/common/src/parquet_writer.cpp \
   firmware/common/src/lz4_codec.cpp \
-  firmware/common/src/pms_frame.cpp \
+  firmware/common/sensors/src/pms_frame.cpp \
   firmware/common/logger/src/aq_logger.cpp \
   firmware/common/logger/src/aq_logger_status.cpp \
   firmware/common/logger/src/aq_logger_provision.cpp \
