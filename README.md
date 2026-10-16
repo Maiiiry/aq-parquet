@@ -31,12 +31,12 @@ at a configurable precision (default maximum resolution 5), firmware derives
 its center, and optional owner-declared country is included in Parquet metadata.
 Location changes split immutable files. See [time and location](docs/shared/time-and-location.md).
 
-The toolchain pins **ESP-IDF 6.1**. Managed components pin **M5Unified 0.2.25** and
-**M5GFX 0.2.31** for CoreS3, **mDNS 1.14.0** for connectivity, and **led_strip
+The toolchain pins **ESP-IDF 6.1**. Managed components pin **M5Unified 0.2.26** and
+**M5GFX 0.2.33** for CoreS3, **mDNS 1.14.0** for connectivity, and **led_strip
 3.1.0~1** for Waveshare; vendored LZ4 remains 1.10.0 and H3 is pinned to 4.5.0.
-Pins were checked on **2026-10-09**. M5GFX 0.2.32 is now available; the
-[development guide](docs/shared/development.md#host-and-toolchain) records why
-this hardware qualification retains 0.2.31. [ESP-IDF 6.1 documentation](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/index.html)
+Pins were checked on **2026-10-16** and track the latest stable releases. The
+[development guide](docs/shared/development.md#host-and-toolchain) records the
+pin policy. [ESP-IDF 6.1 documentation](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/index.html)
 and [development workflow](docs/shared/development.md) describe the native build.
 [Native board/fixture builds and host gates passed on 2026-10-09](docs/shared/development.md#native-migration-validation-2026-10-09).
 CoreS3 also passed a [short native hardware readback](docs/boards/m5stack-cores3/bench-verified.md#board-1-first-native-esp-idf-flash-and-readback); Waveshare remains unqualified on hardware.
@@ -123,7 +123,13 @@ Current boards: [M5Stack CoreS3](docs/boards/m5stack-cores3/README.md) (K128, 16
 
 Licensed under [CC BY 4.0](LICENSE), matching other Walkthru.Earth repositories.
 
-Exception: vendored [LZ4 1.10.0](firmware/common/vendor/lz4/README.md) retains its BSD-2-Clause license and upstream notices.
+The CC BY 4.0 license covers only original Walkthru.Earth work. Third-party code
+keeps its own license and notices, including vendored
+[LZ4 1.10.0](firmware/common/vendor/lz4/README.md) (BSD-2-Clause), vendored
+[Uber H3 4.5.0](firmware/common/location/vendor/h3/NOTICE) (Apache-2.0), and the
+ESP-IDF, toolchain and managed components linked into firmware images. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full list and ship it
+with any firmware binary you distribute.
 
 **If you use any of this work, you must credit us visibly.** Attribution belongs
 somewhere a reader actually sees it, such as your README, your documentation, your
