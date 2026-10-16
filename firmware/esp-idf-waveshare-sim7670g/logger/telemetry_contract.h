@@ -1,7 +1,9 @@
 #pragma once
 
+#include "pms5003t_identity.h"
 #include "telemetry_dictionary_digest.h"
 #include <aq_logger.h>
+#include <aq_max17048.h>
 #include <cstring>
 #include <pms_frame.h>
 #include <utc_clock.h>
@@ -47,11 +49,56 @@ enum Field : std::size_t {
   field_count
 };
 using Definition = aqlogger::Field;
+// LIVE JSON key for each field, or nullptr for fields that stay out of the
+// LIVE snapshot. The shared logger emits them in field-table order.
+constexpr const char *live_key(Field field) {
+  switch (field) {
+  case sequence:
+    return "seq";
+  case monotonic_us:
+    return "mono";
+  case event_time_utc_us:
+    return "utc";
+  case pms_status:
+    return "pms";
+  case pm1_cf1_ug_m3:
+    return "c1";
+  case pm25_cf1_ug_m3:
+    return "c25";
+  case pm10_cf1_ug_m3:
+    return "c10";
+  case pm1_atmospheric_ug_m3:
+    return "pm1";
+  case pm25_atmospheric_ug_m3:
+    return "pm25";
+  case pm10_atmospheric_ug_m3:
+    return "pm10";
+  case particles_gt03_per_01l:
+    return "n03";
+  case particles_gt05_per_01l:
+    return "n05";
+  case particles_gt10_per_01l:
+    return "n1";
+  case particles_gt25_per_01l:
+    return "n25";
+  case ambient_temperature_c:
+    return "t";
+  case relative_humidity_percent:
+    return "rh";
+  case battery_mv:
+    return "bat";
+  case battery_percent:
+    return "pct";
+  default:
+    return nullptr;
+  }
+}
 constexpr Definition kFields[] = {
 #define FIELD(name, type, procedure, unit, validity)                           \
-  {#name,      PhysicalType::type,                                             \
-   #procedure, unit,                                                           \
-   #validity,  "urn:walkthru-earth:waveshare-sim7670g:property:" #name},
+  {#name,         PhysicalType::type,                                          \
+   #procedure,    unit,                                                        \
+   #validity,     "urn:walkthru-earth:waveshare-sim7670g:property:" #name,     \
+   live_key(name)},
 #include "telemetry_fields.inc"
 #undef FIELD
 };
@@ -125,23 +172,10 @@ enum BatchCandidateStatus : std::int32_t {
   kBatchCandidate = 3,
 };
 inline std::int64_t serial_code(const SensorProfile &sensor) {
-  if (!sensor.vendor || !sensor.model || !sensor.serial ||
-      std::strcmp(sensor.vendor, "Plantower") != 0 ||
-      std::strcmp(sensor.model, "PMS5003T") != 0 ||
-      std::strlen(sensor.serial) < 18 || std::strlen(sensor.serial) > 26 ||
-      std::strncmp(sensor.serial, "PMS5003T-", 9) != 0)
-    return 0;
-  std::int64_t code = 0;
-  for (const char *p = sensor.serial + 9; *p; ++p) {
-    if (*p < '0' || *p > '9')
-      return 0;
-    code = code * 10 + (*p - '0');
-  }
-  return code;
+  return pms5003t::serial_code(sensor.vendor, sensor.model, sensor.serial);
 }
 inline bool exact_batch(const SensorProfile &sensor) {
-  return serial_code(sensor) != 0 &&
-         std::strncmp(sensor.serial, "PMS5003T-20260408", 17) == 0;
+  return pms5003t::batch_eligible(sensor.vendor, sensor.model, sensor.serial);
 }
 // Sensor stays powered: warm-up uses boot uptime. Add a sensor-start anchor
 // if sleep/reset control is introduced. Apply only to a fresh, zeroed row.
@@ -198,17 +232,10 @@ struct GaugeSnapshot {
   std::int32_t millivolts = 0;
   std::int32_t percent = 0; // whole percent, truncated and capped at 100
 };
-// MAX17048 VCELL (0x02) is 78.125 uV/LSB; SOC (0x04) is 1/256 %/LSB.
-// The gauge can estimate above 100% near full charge; cap the UI value while
-// rejecting a clearly implausible raw result. This board read 107.8% on USB;
-// the 120% rejection threshold is a project heuristic, not a datasheet limit.
-inline GaugeSnapshot decode_max17048(std::uint16_t vcell, std::uint16_t soc) {
-  const auto millivolts = static_cast<std::int32_t>(vcell) * 5 / 64;
-  const bool plausible =
-      millivolts >= 2500 && millivolts <= 4500 && soc <= 120 * 256;
-  const auto percent =
-      soc >= 100 * 256 ? 100 : static_cast<std::int32_t>(soc) / 256;
-  return {true, plausible, millivolts, percent};
+// Decoding and range checks live in the shared aq::Max17048 driver. This
+// board only adds the explicit battery-installed configuration.
+inline GaugeSnapshot gauge_snapshot(const aq::Max17048Reading &reading) {
+  return {true, reading.valid(), reading.millivolts, reading.percent};
 }
 inline void apply_gauge(Sample &row, const GaugeSnapshot &gauge) {
   row.integer(gauge_status, !gauge.battery_installed ? 0
