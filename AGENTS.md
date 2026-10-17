@@ -52,6 +52,48 @@ file in `docs/README.md` after this one.
   sample/file and split on changes. Never relabel finalized files.
 - Bench claims require dated board evidence with image identity and limits.
   Host tests do not prove SD, radio coexistence or power-cut durability.
+- Only ESP32-S3 on the ESP-IDF pinned in `tools/idf-dependencies.lock` is
+  verified. Do not claim C3, C6, P4 or other chips in READMEs, manifests or
+  Kconfig until a board of that chip has completed the flash checklist below
+  and has a dated bench record.
+- The writer workspace lives in PSRAM with no internal RAM fallback, it cannot
+  fit next to Wi-Fi and NimBLE. A failed allocation prints
+  `PARQUET ERROR operation=allocate mem=psram bytes=N purpose=writer-state
+  logging=false` and stops logging. Worker heartbeat and watchdog rules live in
+  `firmware/common/logger/AGENTS.md`.
+
+## Compatibility, licensing and reviews
+
+- Phone side code may break freely. Never change what a released wire contract
+  means, because boards in the field keep sending it and the phone must still
+  read it. Any change to LIVE keys, columns or field order ships under a new
+  dictionary digest, and a digest is never reused for a different key set. Keep
+  every `live_key` in the board `telemetry_fields.inc` so the digest covers it.
+- Every change the phone can observe (columns, units, field ids, LIVE keys, log
+  lines, versions, digests) gets a newest-first entry in
+  `docs/shared/mobile-migration.md` saying what changed, why, and what the app
+  must do. Bump only the identity strings the change touches. The dictionary
+  string and digest move when `telemetry_fields.inc` changes. The schema string
+  moves when columns, types or annotations change. The firmware identity moves
+  with each release image.
+- Parquet columns keep stable `field_id` values (1-based position in the board
+  `telemetry_fields.inc`. Append only, never reorder, remove or reuse a
+  position). Parquet UTC columns (`*_utc_us`) use `TIMESTAMP(MICROS, UTC)` so
+  files register in Iceberg v3 tables without rewrites. Do not switch them to
+  NANOS, which maps only to v3 `timestamptz_ns` that Spark, Athena and Redshift
+  cannot read. LIVE `utc` and the footer `reconciliation_anchor_utc_ns` stay
+  nanoseconds.
+- Our code is CC-BY-4.0 with Walkthru.Earth attribution. Third-party code keeps
+  its own LICENSE, NOTICE and headers. When a dependency, vendored file or
+  pinned version changes, update `THIRD_PARTY_NOTICES.md` from the linker maps.
+- Ask the owner before creating a new public repository.
+- Every PR gets a CodeRabbit review. Validate each inline comment against the
+  code, fix it or explain why not, reply in that comment's thread and resolve
+  it before merging. CodeRabbit skips draft PRs, so comment
+  `@coderabbitai review` once. If it is rate limited, wait for the window, ask
+  once more, and note the gap on the PR. Commit per major step and post
+  progress on the tracking issue.
+- No em dashes in new or edited docs, commits, PR text or replies.
 
 ## Before any physical flash write
 
