@@ -81,6 +81,39 @@ If the checkout or managed environment moved and a tool reports an old
 interpreter path, run `pixi install` to reconcile it. Use `python -m esptool` /
 `python -m espefuse` through project tasks rather than stale entry-point shebangs.
 
+### C++ dialect
+
+Firmware and host tests are pinned to C++23. ESP-IDF 6.1 adds `-std=gnu++26`
+for chip targets, so every repo-owned component calls
+`aq_pin_cxx_standard(${COMPONENT_LIB})` from
+[`firmware/cmake/aq_cxx_standard.cmake`](../../firmware/cmake/aq_cxx_standard.cmake),
+which appends `$<$<COMPILE_LANGUAGE:CXX>:-std=gnu++23>`. Board and fixture
+projects include that file before `project.cmake`. C sources such as vendored
+H3 keep the SDK C dialect, and third-party components keep the SDK default.
+The standard is named in four places. Change them together.
+
+| Place | Spelling |
+| --- | --- |
+| `firmware/cmake/aq_cxx_standard.cmake` | `-std=gnu++23` in the function body |
+| `tools/host_cxx.py` | `CXX_STD = "-std=c++23"` for every `tools/test_*.py` |
+| `pixi.toml` task `pms-frame-test` | `clang++ -std=c++23` |
+| `tools/lint.sh` | cppcheck `--std=c++23` |
+
+`python tools/check_idf_target.py --cxx-dialect` fails when the four disagree,
+or when a `tools/test_*.py` hardcodes a C++ `-std` instead of importing
+`CXX_STD`. C standards such as `-std=c99` for H3 stay allowed.
+`tools/lint.sh` runs it first. Every board build runs `check_idf_target.py`,
+which repeats that check and reads `build/<variant>/compile_commands.json`. It
+fails when the last `-std` on any repo-owned `.cpp` is not the pinned GNU
+dialect, or when a repo `.c` file gets a C++ standard. `managed_components` and
+build outputs are skipped. Style rules live at the top of
+[`AGENTS.md`](../../AGENTS.md#c-standard-and-style).
+
+On 2026-10-17 one `std::format_to_n` call added to the CoreS3 image at `-Og`
+with xtensa GCC 15.2.0 cost about 341 KB of flash image and 5 KB of DIRAM
+against the same build with `snprintf`. Device code keeps `snprintf` until a
+later toolchain shows a smaller cost.
+
 ## Native migration validation 2026-10-09
 
 The migration passed native board and generic component builds plus host
