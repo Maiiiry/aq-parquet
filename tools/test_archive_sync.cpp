@@ -1,6 +1,8 @@
 #include "abort_signal.h"
+#include "aq_logger_list_job.h"
 #include "aq_logger_transfer_gate.h"
 #include "archive_sync.h"
+#include "storage_governor.h"
 #include "sync_codec.h"
 
 #include <array>
@@ -8,10 +10,12 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <string>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -107,6 +111,17 @@ struct Fixture {
   // Makes the finalized hook fail as if a read hit an I/O error.
   bool check_io_error = false;
   bool listing_complete = true;
+  // Resumable fake walk over list_repeats x names. list_open is true while
+  // the walk holds its directories between steps.
+  std::size_t list_cursor = 0, list_reads = 0, list_steps = 0;
+  std::size_t list_cancels = 0, list_budget_max = 0;
+  bool list_open = false;
+  // Runs between steps, as the storage worker's sample pass does.
+  void (*between_steps)(Fixture &) = nullptr;
+  // The preempted hook reports true while preempt is set, or once this many
+  // frames were delivered (0 never).
+  bool preempt = false;
+  std::size_t preempt_frame = 0;
   std::size_t refuse_frame = 0;
   std::size_t disconnect_frame = 0;
   // Stamp an ABORT on (abort_link, abort_peer) as this frame is delivered.
@@ -144,12 +159,35 @@ struct Fixture {
   aqsync::ArchiveHooks archive() {
     return {
         this,
-        [](void *ctx, aqsync::FileEmitter emit, void *out) {
+        [](void *ctx, bool begin, unsigned budget, aqsync::FileEmitter emit,
+           void *out, unsigned &partials) {
           auto &f = *static_cast<Fixture *>(ctx);
-          for (unsigned repeat = 0; repeat < f.list_repeats; ++repeat)
-            for (const auto &name : f.names)
-              emit(out, name.c_str(), f.bytes.size());
-          return aqsync::ListResult{f.partials, f.listing_complete};
+          assert(budget > 0);
+          ++f.list_steps;
+          if (budget > f.list_budget_max)
+            f.list_budget_max = budget;
+          if (begin) {
+            f.list_cursor = 0;
+            f.list_open = true;
+          }
+          assert(f.list_open);
+          const std::size_t total = f.list_repeats * f.names.size();
+          for (unsigned read = 0; read < budget; ++read) {
+            if (f.list_cursor == total) {
+              f.list_open = false;
+              if (!f.listing_complete)
+                return aqsync::ListStatus::Failed;
+              partials += f.partials;
+              return aqsync::ListStatus::Complete;
+            }
+            ++f.list_reads;
+            const auto &name = f.names[f.list_cursor++ % f.names.size()];
+            if (!emit(out, name.c_str(), f.bytes.size())) {
+              f.list_open = false;
+              return aqsync::ListStatus::Stopped;
+            }
+          }
+          return aqsync::ListStatus::More;
         },
         [](void *ctx, const char *name, char *path, std::size_t size) {
           auto &f = *static_cast<Fixture *>(ctx);
@@ -200,7 +238,19 @@ struct Fixture {
           ++f.buffer_requests;
           return f.buffers[index].data();
         },
-        [](void *ctx) { return static_cast<Fixture *>(ctx)->clock_us += 250; }};
+        [](void *ctx) { return static_cast<Fixture *>(ctx)->clock_us += 250; },
+        [](void *ctx) {
+          auto &f = *static_cast<Fixture *>(ctx);
+          ++f.list_cancels;
+          f.list_open = false;
+        },
+        [](void *ctx) {
+          const auto &f = *static_cast<Fixture *>(ctx);
+          // The firmware hook reads the battery close, as the gate does.
+          return f.preempt ||
+                 (f.preempt_frame && f.frames.size() >= f.preempt_frame) ||
+                 (f.close && f.close->preempt(0));
+        }};
   }
   aqsync::ArchiveTransport transport() {
     return {this,
@@ -243,6 +293,18 @@ struct Fixture {
             [](void *ctx) { ++static_cast<Fixture *>(ctx)->progress; }};
   }
 };
+// Handles a request as the storage worker does, then runs a LIST job it
+// started to its end, one bounded step per worker pass.
+bool serve(aqsync::ArchiveSession &session, const ble::ControlRequest &r,
+           bool storage_ready, Fixture *f = nullptr) {
+  const bool handled = session.handle(r, storage_ready);
+  while (session.listing()) {
+    session.step(storage_ready);
+    if (f && f->between_steps)
+      f->between_steps(*f);
+  }
+  return handled;
+}
 ble::ControlRequest request(Fixture &f, ble::Op op,
                             ble::Link link = ble::Link::Ble,
                             std::uint8_t peer = 0) {
@@ -339,7 +401,7 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
   f.clear();
   const auto queued = stamped(request(f, ble::kOpList));
   stamp_abort(ble::Link::Ble, 0, f.generation[0]);
-  assert(session.handle(queued, true));
+  assert(serve(session, queued, true));
   expect_aborted(ble::kOpList, ble::Link::Ble, 0);
   assert(f.frames.empty() && f.logs.empty() && f.listed == listed);
   auto marker = stamp_abort(ble::Link::Ble, 0, f.generation[0]);
@@ -352,7 +414,7 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
     f.clear();
     f.abort_frame = 2;
     f.abort_link = link;
-    session.handle(stamped(request(f, ble::kOpList, link)), true);
+    serve(session, stamped(request(f, ble::kOpList, link)), true);
     assert(f.frames.size() == 2);
     for (const auto &frame : f.frames)
       assert(frame.bytes[0] == ble::kFrameFile);
@@ -372,7 +434,7 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
   reset_abort();
   f.clear();
   f.abort_frame = f.refuse_frame = 3;
-  session.handle(stamped(request(f, ble::kOpList)), true);
+  serve(session, stamped(request(f, ble::kOpList)), true);
   assert(f.frames.size() == 3);
   expect_aborted(ble::kOpList, ble::Link::Ble, 0);
   assert(f.logs.size() == 1 &&
@@ -389,7 +451,7 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
     f.refuse_frame = refuse;
     f.abort_link = ble::Link::Lan;
     f.abort_peer = 2;
-    session.handle(stamped(read(f, handle, 0, 8000, ble::Link::Lan, 2)), true);
+    serve(session, stamped(read(f, handle, 0, 8000, ble::Link::Lan, 2)), true);
     assert(f.frames.size() == 2);
     for (const auto &frame : f.frames)
       assert(frame.bytes[0] == ble::kFrameChunk && frame.peer == 2);
@@ -403,12 +465,12 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
   f.clear();
   const auto queued_read = stamped(read(f, handle, 0, 100, ble::Link::Lan, 2));
   stamp_abort(ble::Link::Lan, 2, f.generation[slot(ble::Link::Lan, 2)]);
-  session.handle(queued_read, true);
+  serve(session, queued_read, true);
   expect_aborted(ble::kOpRead, ble::Link::Lan, 2);
   assert(f.frames.empty());
   // The handle survives the ABORT; a fresh READ after it runs normally.
   f.clear();
-  session.handle(stamped(read(f, handle, 10, 3000, ble::Link::Lan, 2)), true);
+  serve(session, stamped(read(f, handle, 10, 3000, ble::Link::Lan, 2)), true);
   verify_read(f, handle, 10, 3000, 1024, ble::Link::Lan, 2);
 
   // Stale marker: the stop was recorded under generation g, the marker
@@ -417,7 +479,7 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
   f.clear();
   const auto old_list = stamped(request(f, ble::kOpList, ble::Link::Lan, 1));
   stamp_abort(ble::Link::Lan, 1, f.generation[slot(ble::Link::Lan, 1)]);
-  session.handle(old_list, true);
+  serve(session, old_list, true);
   expect_aborted(ble::kOpList, ble::Link::Lan, 1);
   marker =
       stamp_abort(ble::Link::Lan, 1, f.generation[slot(ble::Link::Lan, 1)] + 1);
@@ -431,7 +493,7 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
   stamp_abort(ble::Link::Ble, 0, f.generation[0]);
   stamp_abort(ble::Link::Lan, 0, f.generation[slot(ble::Link::Lan, 0)]);
   stamp_abort(ble::Link::Lan, 1, f.generation[slot(ble::Link::Lan, 1)]);
-  session.handle(other_list, true);
+  serve(session, other_list, true);
   assert(f.errors.empty() && f.frames.size() == 6 &&
          f.frames.back().bytes[0] == ble::kFrameListEnd &&
          get_u32(f.frames.back().bytes.data() + 1) == 5);
@@ -439,12 +501,12 @@ void abort_cases(Fixture &f, aqsync::ArchiveSession &session) {
   f.abort_frame = 1;
   f.abort_link = ble::Link::Lan;
   f.abort_peer = 1;
-  session.handle(stamped(read(f, handle, 0, 3000, ble::Link::Lan, 2)), true);
+  serve(session, stamped(read(f, handle, 0, 3000, ble::Link::Lan, 2)), true);
   verify_read(f, handle, 0, 3000, 1024, ble::Link::Lan, 2);
   f.clear();
   f.abort_frame = 1;
   f.abort_link = ble::Link::Ble;
-  session.handle(stamped(request(f, ble::kOpList, ble::Link::Lan, 2)), true);
+  serve(session, stamped(request(f, ble::kOpList, ble::Link::Lan, 2)), true);
   assert(f.errors.empty() && f.frames.back().bytes[0] == ble::kFrameListEnd);
   for (std::uint8_t peer = 0; peer < 3; ++peer) {
     const auto link = peer ? ble::Link::Lan : ble::Link::Ble;
@@ -474,7 +536,7 @@ void persistent_cases(Fixture &f, aqsync::ArchiveSession &session,
     const std::uint32_t count =
         f.bytes.size() - offset < 4096 ? f.bytes.size() - offset : 4096;
     f.clear();
-    session.handle(read(f, handle, offset, count, ble::Link::Lan, 1), true);
+    serve(session, read(f, handle, offset, count, ble::Link::Lan, 1), true);
     verify_read(f, handle, offset, count, 1024, ble::Link::Lan, 1);
     assert(descriptor_count() == idle_descriptors + 1);
   }
@@ -483,14 +545,14 @@ void persistent_cases(Fixture &f, aqsync::ArchiveSession &session,
   session.release_files();
   assert(descriptor_count() == idle_descriptors);
   f.clear();
-  session.handle(read(f, handle, 0, 10, ble::Link::Lan, 1), true);
+  serve(session, read(f, handle, 0, 10, ble::Link::Lan, 1), true);
   assert(f.errors.empty() && f.frames.size() == 1 &&
          f.frames[0].bytes[0] == ble::kFrameReadEnd &&
          f.frames[0].bytes[7] == ble::kErrOpenFailed);
   assert(descriptor_count() == idle_descriptors);
   assert(std::rename(moved.c_str(), path.c_str()) == 0);
   f.clear();
-  session.handle(read(f, handle, 333, 1500, ble::Link::Lan, 1), true);
+  serve(session, read(f, handle, 333, 1500, ble::Link::Lan, 1), true);
   verify_read(f, handle, 333, 1500, 1024, ble::Link::Lan, 1);
   assert(descriptor_count() == idle_descriptors + 1);
   assert(f.checks == checks + 1 && f.buffer_requests == buffers + 2);
@@ -510,7 +572,7 @@ void persistent_cases(Fixture &f, aqsync::ArchiveSession &session,
   const char *name = "sample.parquet";
   std::memcpy(rejected.bytes + 1, name, std::strlen(name));
   rejected.length += std::strlen(name);
-  session.handle(rejected, true);
+  serve(session, rejected, true);
   expect_error(f, ble::kErrNotFinalized);
   f.complete = true;
   assert(descriptor_count() == idle_descriptors + 1);
@@ -520,7 +582,7 @@ void persistent_cases(Fixture &f, aqsync::ArchiveSession &session,
   const char *absent = "absent.parquet";
   std::memcpy(missing.bytes + 1, absent, std::strlen(absent));
   missing.length += std::strlen(absent);
-  session.handle(missing, true);
+  serve(session, missing, true);
   expect_error(f, ble::kErrNotFinalized);
   assert(f.checks == before_missing);
   assert(descriptor_count() == idle_descriptors + 1);
@@ -530,11 +592,11 @@ void persistent_cases(Fixture &f, aqsync::ArchiveSession &session,
   {
     DescriptorLimit limit;
     f.clear();
-    session.handle(rejected, true);
+    serve(session, rejected, true);
     expect_error(f, ble::kErrOpenFailed);
     assert(f.logs.size() == 1 && f.logs[0].find("BLE OPEN FAIL errno=") == 0);
     f.clear();
-    session.handle(read(f, lan, 4000, 2000, ble::Link::Lan, 1), true);
+    serve(session, read(f, lan, 4000, 2000, ble::Link::Lan, 1), true);
     verify_read(f, lan, 4000, 2000, 1024, ble::Link::Lan, 1);
   }
   session.close();
@@ -561,7 +623,7 @@ std::vector<std::uint8_t> other_parquet(std::size_t size) {
 void expect_bad_handle_read(Fixture &f, aqsync::ArchiveSession &session,
                             std::uint16_t handle) {
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   assert(f.errors.size() == 1 && f.errors[0].op == ble::kOpRead);
   expect_error(f, ble::kErrBadHandle);
 }
@@ -574,7 +636,7 @@ void remount(aqsync::ArchiveSession &session) {
 void expect_open_failed_read(Fixture &f, aqsync::ArchiveSession &session,
                              std::uint16_t handle, std::uint32_t offset) {
   f.clear();
-  session.handle(read(f, handle, offset, 10), true);
+  serve(session, read(f, handle, offset, 10), true);
   assert(f.errors.empty() && f.frames.size() == 1);
   const auto &end = f.frames[0].bytes;
   assert(end.size() == 8 && end[0] == ble::kFrameReadEnd &&
@@ -592,20 +654,20 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   remount(session);
   assert(descriptor_count() == idle_descriptors);
   f.clear();
-  session.handle(read(f, handle, 100, 3000), true);
+  serve(session, read(f, handle, 100, 3000), true);
   verify_read(f, handle, 100, 3000, 512);
   assert(f.checks == ++checks);
   assert(f.logs.size() == 2 &&
          f.logs[0].find("BLE READ RECHECK handle=") == 0 &&
          f.logs[0].find(" result=same check_us=") != std::string::npos);
   f.clear();
-  session.handle(read(f, handle, 5000, 2000), true);
+  serve(session, read(f, handle, 5000, 2000), true);
   verify_read(f, handle, 5000, 2000, 512);
   assert(f.checks == checks);
   // A later release_files() on the same mount reopens without a check.
   session.release_files();
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   verify_read(f, handle, 0, 10, 512);
   assert(f.checks == checks && descriptor_count() == idle_descriptors + 1);
 
@@ -616,7 +678,7 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
     session.remounted();
     remount(session);
     f.clear();
-    session.handle(read(f, handle, 64, 64), true);
+    serve(session, read(f, handle, 64, 64), true);
     verify_read(f, handle, 64, 64, 512);
     assert(f.checks == ++checks);
   }
@@ -627,14 +689,14 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   {
     DescriptorLimit limit;
     f.clear();
-    session.handle(read(f, handle, 0, 10), true);
+    serve(session, read(f, handle, 0, 10), true);
     assert(f.errors.empty() && f.frames.size() == 1 &&
            f.frames[0].bytes[0] == ble::kFrameReadEnd &&
            f.frames[0].bytes[7] == ble::kErrOpenFailed);
     assert(f.checks == checks);
   }
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   verify_read(f, handle, 0, 10, 512);
   assert(f.checks == ++checks);
 
@@ -652,7 +714,7 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   auto close_request = request(f, ble::kOpClose);
   close_request.length = 3;
   put_u16(close_request.bytes + 1, handle);
-  session.handle(close_request, true);
+  serve(session, close_request, true);
   expect_error(f, ble::kErrBadHandle);
   write_file(path, f.bytes);
 
@@ -691,11 +753,11 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   handle = open(f, session);
   assert(f.checks == ++checks);
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   verify_read(f, handle, 0, 10, 512);
   assert(f.checks == checks);
   f.clear();
-  session.handle(read(f, lan, 0, 10, ble::Link::Lan, 2), true);
+  serve(session, read(f, lan, 0, 10, ble::Link::Lan, 2), true);
   verify_read(f, lan, 0, 10, 1024, ble::Link::Lan, 2);
   assert(f.checks == ++checks);
   session.close();
@@ -710,7 +772,7 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   close_request = request(f, ble::kOpClose);
   close_request.length = 3;
   put_u16(close_request.bytes + 1, handle);
-  session.handle(close_request, true);
+  serve(session, close_request, true);
   assert(f.errors.empty() && f.frames.size() == 1 &&
          f.frames[0].bytes[0] == ble::kFrameClosed &&
          get_u16(f.frames[0].bytes.data() + 1) == handle);
@@ -729,7 +791,7 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   handle = open(f, session);
   assert(f.checks == ++checks);
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   verify_read(f, handle, 0, 10, 512);
   assert(f.checks == checks);
 
@@ -748,7 +810,7 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   assert(std::rename(away.c_str(), path.c_str()) == 0);
   session.mounted();
   f.clear();
-  session.handle(read(f, handle, 100, 3000), true);
+  serve(session, read(f, handle, 100, 3000), true);
   verify_read(f, handle, 100, 3000, 512);
   assert(f.checks == ++checks);
 
@@ -764,7 +826,7 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
   assert(f.checks == ++checks);
   f.check_io_error = false;
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   verify_read(f, handle, 0, 10, 512);
   assert(f.checks == ++checks);
 
@@ -840,16 +902,561 @@ void remount_cases(Fixture &f, aqsync::ArchiveSession &session,
 }
 } // namespace
 
+// LIST runs as a job of bounded steps (issue #33). handle() starts it and
+// the storage worker calls step() once per pass.
+void list_job_cases(Fixture &f, aqsync::ArchiveSession &session) {
+  namespace abort = aqsync::abort;
+  constexpr auto kStep = aqsync::ArchiveSession::kListStepEntries;
+  const auto stamped = [](ble::ControlRequest r) {
+    abort::stamp(r);
+    abort::commit(r);
+    return r;
+  };
+  const auto file_names = [&] {
+    std::vector<std::string> names;
+    for (const auto &frame : f.frames)
+      if (frame.bytes[0] == ble::kFrameFile)
+        names.emplace_back(frame.bytes.begin() + 5, frame.bytes.end());
+    return names;
+  };
+  const unsigned listed = f.listed;
+  f.payload = {517, 1024, 1024, 1024};
+
+  // handle() only starts the job. Nothing is read before the first step.
+  reset_abort();
+  f.clear();
+  f.list_repeats = 1000;
+  f.list_reads = f.list_steps = f.list_cancels = 0;
+  const auto list = stamped(request(f, ble::kOpList));
+  assert(session.handle(list, true));
+  assert(session.listing() && f.list_reads == 0 && f.frames.empty());
+  const auto *tag = session.list_tag();
+  assert(tag && tag->link == ble::Link::Ble && tag->peer == 0 &&
+         tag->generation == f.generation[0]);
+  session.step(true);
+  assert(session.listing() && f.list_reads == kStep &&
+         f.frames.size() == kStep && f.list_open);
+
+  // ABORT between steps stops the walk before its next read.
+  stamp_abort(ble::Link::Ble, 0, f.generation[0]);
+  const std::size_t reads = f.list_reads;
+  session.step(true);
+  assert(!session.listing() && !session.list_tag());
+  assert(f.list_reads == reads && !f.list_open && f.list_cancels == 1);
+  assert(f.frames.size() == kStep && f.errors.size() == 1 &&
+         f.errors[0].code == ble::kErrAborted &&
+         f.errors[0].op == ble::kOpList);
+  auto marker = stamp_abort(ble::Link::Ble, 0, f.generation[0]);
+  assert(abort::take_stopped(marker) == ble::kOpList);
+
+  // ABORT during a step stops it at the next entry, within one step.
+  reset_abort();
+  f.clear();
+  f.abort_frame = kStep + 7;
+  f.abort_link = ble::Link::Lan;
+  f.abort_peer = 1;
+  std::size_t reads_at_abort = 0;
+  f.list_reads = 0;
+  session.handle(stamped(request(f, ble::kOpList, ble::Link::Lan, 1)), true);
+  while (session.listing()) {
+    session.step(true);
+    if (!reads_at_abort && f.frames.size() >= f.abort_frame)
+      reads_at_abort = f.frames.size();
+  }
+  assert(reads_at_abort == kStep + 7);
+  assert(f.list_reads - reads_at_abort <= kStep && !f.list_open);
+  assert(f.errors.size() == 1 && f.errors[0].code == ble::kErrAborted &&
+         f.errors[0].link == ble::Link::Lan && f.errors[0].peer == 1);
+  marker =
+      stamp_abort(ble::Link::Lan, 1, f.generation[slot(ble::Link::Lan, 1)]);
+  assert(abort::take_stopped(marker) == ble::kOpList);
+
+  // The emitter refusing a frame stops the walk at that entry.
+  reset_abort();
+  f.clear();
+  f.list_reads = 0;
+  f.refuse_frame = kStep + 5;
+  serve(session, request(f, ble::kOpList), true);
+  assert(f.list_reads == kStep + 5 && !f.list_open);
+  assert(f.frames.size() == kStep + 5 && f.errors.size() == 1 &&
+         f.errors[0].code == ble::kErrBusy && f.errors[0].detail == "refused");
+  assert(f.listed == listed);
+
+  // A preemption, for example a critical battery close, ends the job with
+  // ERROR busy before its next read, and leaves no ABORT marker behind.
+  reset_abort();
+  f.clear();
+  f.list_reads = f.list_cancels = 0;
+  session.handle(request(f, ble::kOpList), true);
+  session.step(true);
+  assert(session.listing() && f.list_reads == kStep);
+  f.preempt = true;
+  session.step(true);
+  f.preempt = false;
+  assert(!session.listing() && f.list_reads == kStep && !f.list_open &&
+         f.list_cancels == 1);
+  assert(f.frames.size() == kStep && f.errors.size() == 1 &&
+         f.errors[0].code == ble::kErrBusy && f.errors[0].op == ble::kOpList &&
+         f.errors[0].detail == "preempted");
+  assert(f.listed == listed);
+  marker = stamp_abort(ble::Link::Ble, 0, f.generation[0]);
+  assert(abort::take_stopped(marker) == 0);
+
+  // A preemption raised during a step stops it at the next FILE frame.
+  reset_abort();
+  f.clear();
+  f.list_reads = 0;
+  f.preempt_frame = kStep + 3;
+  serve(session, request(f, ble::kOpList), true);
+  f.preempt_frame = 0;
+  assert(f.list_reads == kStep + 4 && !f.list_open);
+  assert(f.frames.size() == kStep + 3 && f.errors.size() == 1 &&
+         f.errors[0].code == ble::kErrBusy &&
+         f.errors[0].detail == "preempted");
+
+  // An ABORT wins over a preemption that is pending at the same time.
+  reset_abort();
+  f.clear();
+  session.handle(stamped(request(f, ble::kOpList)), true);
+  session.step(true);
+  stamp_abort(ble::Link::Ble, 0, f.generation[0]);
+  f.preempt = true;
+  session.step(true);
+  f.preempt = false;
+  assert(!session.listing() && f.errors.size() == 1 &&
+         f.errors[0].code == ble::kErrAborted);
+  marker = stamp_abort(ble::Link::Ble, 0, f.generation[0]);
+  assert(abort::take_stopped(marker) == ble::kOpList);
+  reset_abort();
+
+  // Bounded steps list exactly what one unbounded pass lists, in order.
+  f.clear();
+  f.names = {"a.parquet", "b.parquet", "c.parquet", "d.parquet", "e.parquet"};
+  f.list_repeats = 41;
+  std::vector<std::string> unbounded;
+  {
+    unsigned partials = 0;
+    const auto hooks = f.archive();
+    const aqsync::FileEmitter collect = [](void *out, const char *name,
+                                           std::uint32_t) {
+      static_cast<std::vector<std::string> *>(out)->push_back(name);
+      return true;
+    };
+    assert(hooks.list(hooks.context, true, UINT32_MAX, collect, &unbounded,
+                      partials) == aqsync::ListStatus::Complete);
+  }
+  f.list_steps = 0;
+  serve(session, request(f, ble::kOpList), true);
+  assert(file_names() == unbounded && unbounded.size() == 205);
+  assert(f.list_steps == (205 + kStep) / kStep);
+  assert(f.frames.back().bytes[0] == ble::kFrameListEnd &&
+         get_u32(f.frames.back().bytes.data() + 1) == 205);
+  assert(f.errors.empty() && f.listed == listed + 1);
+  f.names = {"sample.parquet"};
+
+  // A huge directory never holds the worker for more than one step. The
+  // worker's sample pass runs between steps and every frame is progress.
+  f.clear();
+  f.list_repeats = 10000;
+  f.list_steps = f.list_budget_max = 0;
+  f.progress = 0;
+  static std::size_t passes;
+  passes = 0;
+  f.between_steps = [](Fixture &) { ++passes; };
+  serve(session, request(f, ble::kOpList), true, &f);
+  f.between_steps = nullptr;
+  assert(f.list_budget_max == kStep);
+  assert(f.list_steps == (10000 + kStep) / kStep && passes == f.list_steps);
+  assert(f.progress == f.frames.size() && f.frames.size() == 10001);
+  assert(f.listed == listed + 2);
+
+  // While the job runs, requests on its link and peer wait, a LIST from
+  // another link or peer does not, and other links are served between steps.
+  f.clear();
+  f.list_repeats = 100;
+  session.handle(request(f, ble::kOpList, ble::Link::Lan, 0), true);
+  session.step(true);
+  assert(session.must_wait_for_list(
+      request(f, ble::kOpStatus, ble::Link::Lan, 0)));
+  assert(!session.must_wait_for_list(request(f, ble::kOpList)));
+  assert(
+      session.must_wait_for_list(request(f, ble::kOpList, ble::Link::Lan, 0)));
+  auto marker_request = request(f, ble::kOpAbort, ble::Link::Lan, 0);
+  assert(session.must_wait_for_list(marker_request));
+  assert(!session.must_wait_for_list(request(f, ble::kOpStatus)));
+  assert(
+      !session.must_wait_for_list(request(f, ble::kOpRead, ble::Link::Lan, 2)));
+  const auto other = open(f, session, ble::Link::Lan, "sample.parquet", 2);
+  f.clear();
+  session.handle(read(f, other, 0, 100, ble::Link::Lan, 2), true);
+  assert(session.listing());
+  assert(!f.frames.empty() && f.frames.front().peer == 2);
+  // A LIST from another link or peer is refused at once, the job continues.
+  f.clear();
+  session.handle(request(f, ble::kOpList), true);
+  assert(f.errors.size() == 1 && f.errors[0].code == ble::kErrBusy &&
+         f.errors[0].link == ble::Link::Ble && f.errors[0].detail == "list");
+  assert(session.listing());
+  f.clear();
+  while (session.listing())
+    session.step(true);
+  assert(f.errors.empty() && f.frames.back().bytes[0] == ble::kFrameListEnd &&
+         f.frames.back().peer == 0 &&
+         get_u32(f.frames.back().bytes.data() + 1) == 100);
+  auto close_other = request(f, ble::kOpClose, ble::Link::Lan, 2);
+  close_other.length = 3;
+  put_u16(close_other.bytes + 1, other);
+  serve(session, close_other, true);
+
+  // A peer that left gets no frames, its walk just closes.
+  f.clear();
+  f.list_cancels = 0;
+  session.handle(request(f, ble::kOpList, ble::Link::Lan, 1), true);
+  session.step(true);
+  const std::size_t sent = f.frames.size();
+  ++f.generation[slot(ble::Link::Lan, 1)];
+  session.step(true);
+  assert(!session.listing() && !f.list_open && f.list_cancels == 1);
+  assert(f.frames.size() == sent && f.errors.empty());
+
+  // A step without storage and an erase end the job with ERROR storage, a
+  // remount with ERROR busy "remount" since it is transient. Each closes the
+  // walk. The worker passes storage_ready false only around a failed
+  // remount.
+  for (int cause = 0; cause < 3; ++cause) {
+    f.clear();
+    session.handle(request(f, ble::kOpList), true);
+    session.step(true);
+    assert(f.list_open);
+    if (cause == 0)
+      session.step(false);
+    else if (cause == 1)
+      session.remounted();
+    else
+      session.close();
+    if (cause == 1)
+      session.mounted();
+    assert(!session.listing() && !f.list_open);
+    assert(f.errors.size() == 1 && f.errors[0].op == ble::kOpList &&
+           f.errors[0].link == ble::Link::Ble);
+    if (cause == 1)
+      assert(f.errors[0].code == ble::kErrBusy &&
+             f.errors[0].detail == "remount");
+    else
+      assert(f.errors[0].code == ble::kErrStorage);
+  }
+  f.list_repeats = 1;
+  reset_abort();
+  f.clear();
+}
+
+// The storage worker glue around a LIST job (aq_logger_list_job.h), driven
+// with the real planner, governor and session as the worker runs them.
+void worker_glue_cases(Fixture &f, aqsync::ArchiveSession &session) {
+  namespace listjob = aqlogger::listjob;
+  namespace storage = aqlogger::storage;
+  using listjob::StoragePass;
+  constexpr auto kStep = aqsync::ArchiveSession::kListStepEntries;
+  reset_abort();
+  f.payload = {517, 1024, 1024, 1024};
+
+  // One worker pass of service_storage on a board with a remount hook. A
+  // Probe remounts, which the session sees as remounted() then mounted().
+  struct Storage {
+    storage::Governor governor;
+    listjob::StoragePlanner planner;
+    unsigned remounts = 0, kept = 0, rechecks = 0;
+    std::uint64_t free_bytes = 0;
+    StoragePass pass(aqsync::ArchiveSession &session, std::int64_t now,
+                     bool owner = false) {
+      listjob::StorageInputs in;
+      in.probe_due = governor.probe_due(now);
+      in.can_probe = true;
+      in.recheck_due = governor.recheck_due(now);
+      in.full = governor.state() == storage::State::Full;
+      in.retry = governor.state() == storage::State::Retry;
+      in.remount = true;
+      in.files_closed = true;
+      in.listing = session.listing();
+      in.owner = owner;
+      const auto next = planner.next(in);
+      if (next == StoragePass::Probe) {
+        ++remounts;
+        session.remounted();
+        session.mounted();
+        governor.probe_succeeded(free_bytes, now);
+      } else if (next == StoragePass::KeepMount) {
+        ++kept;
+        governor.probe_succeeded(free_bytes, now);
+      } else if (next == StoragePass::Recheck) {
+        ++rechecks;
+        governor.observe_free(free_bytes, now);
+      }
+      return next;
+    }
+  };
+
+  // A Full card held across several rechecks does not remount mid LIST. The
+  // walk ends with LIST_END and the skipped remount runs after it.
+  {
+    f.clear();
+    f.list_repeats = 12 * kStep;
+    f.list_cancels = 0;
+    Storage card;
+    card.governor.configure(1ULL << 30);
+    card.governor.observe_free(0, 0);
+    assert(card.governor.state() == storage::State::Full);
+    session.handle(request(f, ble::kOpList), true);
+    std::int64_t now = 0;
+    while (session.listing()) {
+      now += 20;
+      card.pass(session, now);
+      session.step(true);
+    }
+    assert(now / storage::kRecheckSeconds >= 3 && card.rechecks >= 3);
+    assert(card.remounts == 0 && card.planner.deferred());
+    assert(card.governor.state() == storage::State::Full);
+    assert(f.errors.empty() && f.list_cancels == 1 && !f.list_open);
+    assert(f.frames.back().bytes[0] == ble::kFrameListEnd &&
+           get_u32(f.frames.back().bytes.data() + 1) == 12 * kStep);
+    assert(card.pass(session, now + 1) == StoragePass::Probe);
+    assert(card.remounts == 1 && !card.planner.deferred());
+    // Without a job the Full recheck remounts as before.
+    assert(card.pass(session, now + 2) == StoragePass::Idle);
+    assert(card.pass(session, now + 1 + storage::kRecheckSeconds) ==
+           StoragePass::Probe);
+  }
+
+  // The same remount without the planner's deferral ends the walk with
+  // ERROR busy "remount", which is what the deferral prevents.
+  {
+    f.clear();
+    f.list_repeats = 4 * kStep;
+    session.handle(request(f, ble::kOpList), true);
+    session.step(true);
+    session.remounted();
+    session.mounted();
+    assert(!session.listing() && f.errors.size() == 1 &&
+           f.errors[0].code == ble::kErrBusy &&
+           f.errors[0].detail == "remount");
+  }
+
+  // A Retry probe due mid LIST keeps the mount. An owner action such as
+  // FLUSH still remounts and ends the job with ERROR busy "remount".
+  {
+    f.clear();
+    f.list_repeats = 4 * kStep;
+    Storage card;
+    card.free_bytes = 1ULL << 30;
+    card.governor.configure(1ULL << 30);
+    card.governor.write_failed(0);
+    assert(card.governor.state() == storage::State::Retry);
+    session.handle(request(f, ble::kOpList), true);
+    session.step(true);
+    assert(card.pass(session, 5) == StoragePass::Idle);
+    card.governor.write_failed(10);
+    card.governor.request_probe();
+    assert(card.pass(session, 11) == StoragePass::KeepMount);
+    assert(card.kept == 1 && card.remounts == 0 && card.planner.deferred());
+    session.step(true);
+    assert(session.listing() && f.errors.empty());
+    card.governor.write_failed(12);
+    card.governor.request_probe();
+    assert(card.pass(session, 13, true) == StoragePass::Probe);
+    assert(!session.listing() && f.errors.size() == 1 &&
+           f.errors[0].code == ble::kErrBusy &&
+           f.errors[0].detail == "remount" && !card.planner.deferred());
+  }
+
+  // A Retry card whose kept probe failed again remounts as soon as the job
+  // ends, without waiting for its backoff.
+  {
+    listjob::StoragePlanner planner;
+    listjob::StorageInputs in;
+    in.probe_due = in.can_probe = in.retry = in.remount = true;
+    in.listing = true;
+    assert(planner.next(in) == StoragePass::KeepMount && planner.deferred());
+    in.probe_due = false;
+    assert(planner.next(in) == StoragePass::Idle && planner.deferred());
+    in.listing = false;
+    assert(planner.next(in) == StoragePass::Probe && !planner.deferred());
+    assert(planner.next(in) == StoragePass::Idle);
+    // A board without a remount hook probes as before, a job or not.
+    in.remount = false;
+    in.probe_due = in.listing = true;
+    assert(planner.next(in) == StoragePass::Probe && !planner.deferred());
+    // A Full card with an open writer file only rechecks.
+    in = listjob::StorageInputs{};
+    in.recheck_due = in.full = in.remount = in.can_probe = true;
+    assert(planner.next(in) == StoragePass::Recheck);
+    // A deferred remount the card no longer needs is dropped.
+    in.files_closed = in.listing = true;
+    assert(planner.next(in) == StoragePass::Recheck && planner.deferred());
+    in = listjob::StorageInputs{};
+    in.can_probe = in.remount = in.files_closed = true;
+    assert(planner.next(in) == StoragePass::Idle && !planner.deferred());
+  }
+
+  // A critical battery close that falls due between steps. The worker's
+  // close pass first ends the job with ERROR busy "preempted", then the
+  // close attempt runs its Retry remount with the walk's directories
+  // already closed, so the phone never sees ERROR storage.
+  {
+    struct CloseCard {
+      Fixture &f;
+      aqsync::ArchiveSession &session;
+      unsigned remounts = 0;
+      bool has_data() const { return true; }
+      bool writable() {
+        assert(!f.list_open && !session.listing());
+        ++remounts;
+        session.remounted();
+        session.mounted();
+        return true;
+      }
+      bool finalize() { return true; }
+    };
+    aqlogger::power::EmergencyClose close;
+    CloseCard card{f, session};
+    f.clear();
+    f.list_repeats = 4 * kStep;
+    f.list_cancels = 0;
+    session.handle(request(f, ble::kOpList, ble::Link::Lan, 1), true);
+    session.step(true);
+    assert(session.listing() && f.list_open);
+    const std::size_t sent = f.frames.size();
+    // Nothing is due, so the pass leaves the job alone.
+    assert(!listjob::preempt_for_close(session, close, 0));
+    assert(!aqlogger::power::service(close, card, 0).attempted);
+    close.request();
+    assert(listjob::preempt_for_close(session, close, 0));
+    const auto pass = aqlogger::power::service(close, card, 0);
+    assert(pass.attempted &&
+           pass.outcome == aqlogger::power::CloseOutcome::Closed);
+    assert(card.remounts == 1 && !f.list_open && f.list_cancels == 1);
+    assert(f.frames.size() == sent && f.errors.size() == 1 &&
+           f.errors[0].code == ble::kErrBusy &&
+           f.errors[0].detail == "preempted" &&
+           f.errors[0].link == ble::Link::Lan && f.errors[0].peer == 1);
+    // An ABORT already pending still wins over the close.
+    f.clear();
+    session.handle(request(f, ble::kOpList), true);
+    session.step(true);
+    stamp_abort(ble::Link::Ble, 0, f.generation[0]);
+    close.request();
+    assert(listjob::preempt_for_close(session, close, 0));
+    assert(!session.listing() && f.errors.size() == 1 &&
+           f.errors[0].code == ble::kErrAborted);
+    reset_abort();
+    assert(close.due(0));
+    close.finish(aqlogger::power::CloseOutcome::Closed, 0);
+  }
+
+  // The queue glue. A request the job holds parks outside the queue, so an
+  // unrelated READ behind it runs between steps, and a LIST from another
+  // link is refused at once. The parked request runs after LIST_END.
+  {
+    const auto reader = open(f, session, ble::Link::Lan, "sample.parquet", 2);
+    f.clear();
+    f.list_repeats = 6 * kStep;
+    std::deque<ble::ControlRequest> queue;
+    ble::ControlRequest parked{};
+    bool has_parked = false;
+    session.handle(request(f, ble::kOpList, ble::Link::Lan, 0), true);
+    auto same_peer = request(f, ble::kOpOpen, ble::Link::Lan, 0);
+    std::memcpy(same_peer.bytes + 1, "sample.parquet", 14);
+    same_peer.length += 14;
+    queue.push_back(same_peer);
+    queue.push_back(read(f, reader, 0, 100, ble::Link::Lan, 2));
+    queue.push_back(request(f, ble::kOpList));
+    std::vector<listjob::Take> takes;
+    std::size_t list_end = 0, opened = 0, read_at = 0, busy_at = 0;
+    for (unsigned pass = 0; pass < 100; ++pass) {
+      if (session.listing())
+        session.step(true);
+      const bool has_head = !queue.empty();
+      const auto take =
+          listjob::take(session.listing(), has_parked, has_head,
+                        has_head && session.must_wait_for_list(queue.front()));
+      takes.push_back(take);
+      if (take == listjob::Take::Wait) {
+        if (!session.listing())
+          break;
+        continue;
+      }
+      if (take == listjob::Take::Park) {
+        parked = queue.front();
+        queue.pop_front();
+        has_parked = true;
+        continue;
+      }
+      if (take == listjob::Take::Parked) {
+        has_parked = false;
+        session.handle(parked, true);
+        continue;
+      }
+      const auto r = queue.front();
+      queue.pop_front();
+      session.handle(r, true);
+      if (r.bytes[0] == ble::kOpRead)
+        read_at = f.frames.size();
+      else
+        busy_at = f.errors.size();
+    }
+    for (std::size_t i = 0; i < f.frames.size(); ++i) {
+      const auto &frame = f.frames[i];
+      if (frame.peer == 0 && frame.bytes[0] == ble::kFrameListEnd)
+        list_end = i + 1;
+      if (frame.peer == 0 && frame.bytes[0] == ble::kFrameOpened)
+        opened = i + 1;
+    }
+    assert(takes[0] == listjob::Take::Park && takes[1] == listjob::Take::Head &&
+           takes[2] == listjob::Take::Head);
+    assert(read_at && read_at < list_end && f.frames[read_at - 1].peer == 2);
+    assert(busy_at == 1 && f.errors[0].link == ble::Link::Ble &&
+           f.errors[0].code == ble::kErrBusy && f.errors[0].detail == "list");
+    assert(list_end && opened == list_end + 1 && f.frames.size() == opened);
+    assert(queue.empty() && !has_parked && !session.listing());
+    // A second request from the job's peer behind a parked one stays at the
+    // head until the job ends, the documented bound.
+    assert(listjob::take(true, true, true, true) == listjob::Take::Wait);
+    assert(listjob::take(true, true, true, false) == listjob::Take::Head);
+    assert(listjob::take(true, false, false, false) == listjob::Take::Wait);
+    assert(listjob::take(false, true, true, false) == listjob::Take::Parked);
+    assert(listjob::take(false, false, true, true) == listjob::Take::Head);
+    const auto parked_handle = get_u16(f.frames[opened - 1].bytes.data() + 1);
+    for (const auto &[link_peer, handle] :
+         {std::pair<std::uint8_t, std::uint16_t>{0, parked_handle},
+          std::pair<std::uint8_t, std::uint16_t>{2, reader}}) {
+      auto done = request(f, ble::kOpClose, ble::Link::Lan, link_peer);
+      done.length = 3;
+      put_u16(done.bytes + 1, handle);
+      serve(session, done, true);
+    }
+  }
+
+  // Serial `parquet list` walks the whole archive and is refused during a
+  // job. `parquet get` opens one file and is not.
+  assert(listjob::serial_walks_archive("parquet list"));
+  assert(!listjob::serial_walks_archive("parquet get sample.parquet"));
+  assert(!listjob::serial_walks_archive("parquet"));
+  assert(!listjob::serial_walks_archive(nullptr));
+
+  f.list_repeats = 1;
+  reset_abort();
+  f.clear();
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   Fixture f(argv[1]);
   aqsync::ArchiveSession session(f.archive(), f.transport());
 
-  assert(!session.handle(request(f, ble::kOpStatus), true));
-  assert(session.handle(request(f, ble::kOpList), false));
+  assert(!serve(session, request(f, ble::kOpStatus), true));
+  assert(serve(session, request(f, ble::kOpList), false));
   expect_error(f, ble::kErrStorage);
   f.clear();
-  assert(session.handle(request(f, ble::kOpList), true));
+  assert(serve(session, request(f, ble::kOpList), true));
   assert(f.frames.size() == 2 && f.listed == 1 && f.progress == 2);
   const auto &list = f.frames.back().bytes;
   assert(list.size() == 15 && list[0] == ble::kFrameListEnd);
@@ -857,7 +1464,7 @@ int main(int argc, char **argv) {
   assert(get_u32(list.data() + 7) == 123 && get_u32(list.data() + 11) == 45);
   f.clear();
   f.refuse_frame = 1;
-  session.handle(request(f, ble::kOpList), true);
+  serve(session, request(f, ble::kOpList), true);
   assert(f.frames.size() == 1 && f.listed == 1); // no LIST_END after refusal
   // A refusal without ABORT still ends LIST with a terminal ERROR busy, so
   // the client never waits for a LIST_END that will not come.
@@ -868,7 +1475,7 @@ int main(int argc, char **argv) {
              std::string::npos);
   f.clear();
   f.payload[0] = 18;
-  session.handle(request(f, ble::kOpList), true);
+  serve(session, request(f, ble::kOpList), true);
   expect_error(f, ble::kErrBusy);
   assert(f.listed == 1); // no false empty listing or cleared new-files hint
   f.payload[0] = 517;
@@ -877,7 +1484,7 @@ int main(int argc, char **argv) {
   for (const auto link : {ble::Link::Ble, ble::Link::Lan}) {
     f.clear();
     f.listing_complete = false;
-    session.handle(request(f, ble::kOpList, link), true);
+    serve(session, request(f, ble::kOpList, link), true);
     assert(f.frames.size() == 1 && f.frames[0].bytes[0] == ble::kFrameFile);
     assert(f.errors.size() == 1 && f.errors[0].op == ble::kOpList &&
            f.errors[0].code == ble::kErrStorage && f.errors[0].link == link);
@@ -886,21 +1493,22 @@ int main(int argc, char **argv) {
   f.listing_complete = true;
   f.clear();
   f.refuse_frame = 2; // LIST_END delivery fails after a successful traversal.
-  session.handle(request(f, ble::kOpList), true);
+  serve(session, request(f, ble::kOpList), true);
   assert(f.frames.size() == 2 && f.listed == 1);
   f.clear();
-  session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
+  serve(session, request(f, ble::kOpList, ble::Link::Lan), true);
   assert(f.frames.size() == 2 && f.listed == 2 && f.errors.empty());
   f.clear();
   f.list_repeats = 70000; // Proto 3 LIST_END count is u32, past the old cap.
-  session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
+  serve(session, request(f, ble::kOpList, ble::Link::Lan), true);
   assert(f.frames.size() == 70001 && f.listed == 3 && f.errors.empty());
   assert(f.frames.back().bytes[0] == ble::kFrameListEnd &&
          f.frames.back().bytes.size() == 15 &&
          get_u32(f.frames.back().bytes.data() + 1) == 70000);
   f.list_repeats = 1;
-  // A critical battery close raised mid LIST stops it at the next FILE
-  // through the logger's gate, with the same terminal ERROR busy. The worker
+  // A critical battery close raised mid LIST stops it before the next FILE
+  // through the session's preempted hook with ERROR busy "preempted". The
+  // gate passes FILE frames and refuses only READ CHUNK frames. The worker
   // runs the close, then a retried LIST completes.
   {
     aqlogger::power::EmergencyClose close;
@@ -908,18 +1516,24 @@ int main(int argc, char **argv) {
     f.list_repeats = 3;
     f.close = &close;
     f.raise_close_after = 1;
-    session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
-    assert(f.frames.size() == 1 && f.frames[0].bytes[0] == ble::kFrameFile);
+    serve(session, request(f, ble::kOpList, ble::Link::Lan), true);
+    assert(f.frames.size() == 2 && f.frames[1].bytes[0] == ble::kFrameFile);
     assert(f.errors.size() == 1 && f.errors[0].op == ble::kOpList &&
            f.errors[0].code == ble::kErrBusy &&
-           f.errors[0].detail == "refused" &&
+           f.errors[0].detail == "preempted" &&
            f.errors[0].link == ble::Link::Lan);
+    // A LIST while the close is still due is answered at once, no job.
+    f.clear();
+    serve(session, request(f, ble::kOpList), true);
+    assert(!session.listing() && f.frames.empty() && f.errors.size() == 1 &&
+           f.errors[0].code == ble::kErrBusy &&
+           f.errors[0].detail == "preempted");
     const unsigned listed_before = f.listed;
     assert(close.due(0) && close.finish(aqlogger::power::CloseOutcome::Closed,
                                         0) == aqlogger::power::Next::Done);
     f.clear();
     f.raise_close_after = static_cast<std::size_t>(-1);
-    session.handle(request(f, ble::kOpList, ble::Link::Lan), true);
+    serve(session, request(f, ble::kOpList, ble::Link::Lan), true);
     assert(f.frames.size() == 4 && f.errors.empty() &&
            f.listed == listed_before + 1 &&
            f.frames.back().bytes[0] == ble::kFrameListEnd);
@@ -927,6 +1541,8 @@ int main(int argc, char **argv) {
     f.raise_close_after = 0;
     f.list_repeats = 1;
   }
+  list_job_cases(f, session);
+  worker_glue_cases(f, session);
 
   auto handle = open(f, session);
   f.clear();
@@ -935,61 +1551,61 @@ int main(int argc, char **argv) {
   const char *file_name = "sample.parquet";
   std::memcpy(too_small.bytes + 1, file_name, std::strlen(file_name));
   too_small.length += std::strlen(file_name);
-  session.handle(too_small, true);
+  serve(session, too_small, true);
   expect_error(f, ble::kErrBusy);
   f.payload[0] = 517;
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   verify_read(f, handle, 0, 10, 512); // rejected OPEN preserves prior handle
   f.clear();
-  session.handle(read(f, handle, 0, UINT32_MAX), true);
+  serve(session, read(f, handle, 0, UINT32_MAX), true);
   verify_read(f, handle, 0, ble::kMaxRead, 512);
   f.clear();
-  session.handle(read(f, handle, f.bytes.size() - 15, 200), true);
+  serve(session, read(f, handle, f.bytes.size() - 15, 200), true);
   verify_read(f, handle, f.bytes.size() - 15, 15, 512);
   f.clear();
-  session.handle(read(f, handle, f.bytes.size() + 1, 1), true);
+  serve(session, read(f, handle, f.bytes.size() + 1, 1), true);
   expect_error(f, ble::kErrRange);
   f.clear();
-  session.handle(read(f, handle, 0, 10, ble::Link::Lan), true);
+  serve(session, read(f, handle, 0, 10, ble::Link::Lan), true);
   expect_error(f, ble::kErrBadHandle, ble::Link::Lan);
   ++f.generation[1]; // another transport reconnect cannot kill a BLE handle
   f.clear();
-  session.handle(read(f, handle, 7, 22), true);
+  serve(session, read(f, handle, 7, 22), true);
   verify_read(f, handle, 7, 22, 512);
   ++f.generation[0];
   f.clear();
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   expect_error(f, ble::kErrBadHandle);
 
   handle = open(f, session, ble::Link::Lan);
   f.clear();
-  session.handle(read(f, handle, 123, 2040, ble::Link::Lan), true);
+  serve(session, read(f, handle, 123, 2040, ble::Link::Lan), true);
   verify_read(f, handle, 123, 2040, 1024, ble::Link::Lan);
   f.clear();
   auto malformed = read(f, handle, 0, 10, ble::Link::Lan);
   --malformed.length;
-  session.handle(malformed, true);
+  serve(session, malformed, true);
   expect_error(f, ble::kErrMalformed, ble::Link::Lan);
   f.clear();
   f.refuse_frame = 2;
-  session.handle(read(f, handle, 0, 4000, ble::Link::Lan), true);
+  serve(session, read(f, handle, 0, 4000, ble::Link::Lan), true);
   assert(f.frames.size() == 3 &&
          f.frames.back().bytes[0] == ble::kFrameReadEnd);
   assert(get_u32(f.frames.back().bytes.data() + 3) == 1017);
   assert(f.frames.back().bytes[7] == ble::kErrBusy);
   f.clear();
-  session.handle(read(f, handle, 1017, 4000 - 1017, ble::Link::Lan), true);
+  serve(session, read(f, handle, 1017, 4000 - 1017, ble::Link::Lan), true);
   verify_read(f, handle, 1017, 4000 - 1017, 1024, ble::Link::Lan);
 
   f.clear();
   auto close = request(f, ble::kOpClose, ble::Link::Lan);
   close.length = 3;
   put_u16(close.bytes + 1, handle);
-  session.handle(close, true);
+  serve(session, close, true);
   assert(f.frames.size() == 1 && f.frames[0].bytes[0] == ble::kFrameClosed);
   f.clear();
-  session.handle(read(f, handle, 0, 10, ble::Link::Lan), true);
+  serve(session, read(f, handle, 0, 10, ble::Link::Lan), true);
   expect_error(f, ble::kErrBadHandle, ble::Link::Lan);
 
   f.clear();
@@ -997,20 +1613,20 @@ int main(int argc, char **argv) {
   const char *name = "../secret.parquet";
   std::memcpy(invalid.bytes + 1, name, std::strlen(name));
   invalid.length += std::strlen(name);
-  session.handle(invalid, true);
+  serve(session, invalid, true);
   expect_error(f, ble::kErrInvalidName);
   f.clear();
   f.complete = false;
   const char *valid = "sample.parquet";
   std::memcpy(invalid.bytes + 1, valid, std::strlen(valid));
   invalid.length = 1 + std::strlen(valid);
-  session.handle(invalid, true);
+  serve(session, invalid, true);
   expect_error(f, ble::kErrNotFinalized);
   f.complete = true;
   handle = open(f, session);
   f.clear();
   f.payload[0] = 7;
-  session.handle(read(f, handle, 0, 10), true);
+  serve(session, read(f, handle, 0, 10), true);
   assert(f.frames.size() == 1 && f.frames[0].bytes[0] == ble::kFrameReadEnd &&
          f.frames[0].bytes[7] == ble::kErrBusy);
   session.close();
@@ -1034,31 +1650,31 @@ int main(int argc, char **argv) {
   assert(descriptor_count() == idle_descriptors + all_slots);
   for (std::uint8_t peer = 0; peer < ble::kMaxLanClients; ++peer) {
     f.clear();
-    session.handle(
-        read(f, lan_handles[peer], peer * 100, 2000, ble::Link::Lan, peer),
-        true);
+    serve(session,
+          read(f, lan_handles[peer], peer * 100, 2000, ble::Link::Lan, peer),
+          true);
     verify_read(f, lan_handles[peer], peer * 100, 2000, 1024, ble::Link::Lan,
                 peer);
     assert(descriptor_count() == idle_descriptors + all_slots);
     f.clear();
-    session.handle(request(f, ble::kOpList, ble::Link::Lan, peer), true);
+    serve(session, request(f, ble::kOpList, ble::Link::Lan, peer), true);
     assert(f.frames.size() == 2);
     for (const auto &frame : f.frames)
       assert(frame.link == ble::Link::Lan && frame.peer == peer);
   }
   f.clear();
-  session.handle(read(f, ble_handle, 37, 900), true);
+  serve(session, read(f, ble_handle, 37, 900), true);
   verify_read(f, ble_handle, 37, 900, 512);
 
   // A peer cannot READ or CLOSE another peer's handle.
   f.clear();
-  session.handle(read(f, lan_handles[0], 0, 10, ble::Link::Lan, 1), true);
+  serve(session, read(f, lan_handles[0], 0, 10, ble::Link::Lan, 1), true);
   expect_error(f, ble::kErrBadHandle, ble::Link::Lan, 1);
   auto wrong_close = request(f, ble::kOpClose, ble::Link::Lan, 1);
   wrong_close.length = 3;
   put_u16(wrong_close.bytes + 1, lan_handles[0]);
   f.clear();
-  session.handle(wrong_close, true);
+  serve(session, wrong_close, true);
   expect_error(f, ble::kErrBadHandle, ble::Link::Lan, 1);
 
   // OPEN and CLOSE invalidate only the requesting slot. A re-OPEN replaces the
@@ -1070,12 +1686,12 @@ int main(int argc, char **argv) {
   own_close.length = 3;
   put_u16(own_close.bytes + 1, reopened);
   f.clear();
-  session.handle(own_close, true);
+  serve(session, own_close, true);
   assert(f.frames.size() == 1 && f.frames[0].peer == 0 &&
          f.frames[0].bytes[0] == ble::kFrameClosed);
   assert(descriptor_count() == idle_descriptors + all_slots - 1);
   f.clear();
-  session.handle(read(f, lan_handles[1], 91, 10, ble::Link::Lan, 1), true);
+  serve(session, read(f, lan_handles[1], 91, 10, ble::Link::Lan, 1), true);
   verify_read(f, lan_handles[1], 91, 10, 1024, ble::Link::Lan, 1);
 
   // Stale queued OPEN/CLOSE requests cannot mutate a replacement peer.
@@ -1092,32 +1708,32 @@ int main(int argc, char **argv) {
   const auto replacement = open(f, session, ble::Link::Lan, sample, 1);
   assert(descriptor_count() == idle_descriptors + all_slots - 1);
   f.clear();
-  session.handle(stale_open, true);
-  session.handle(stale_close, true);
+  serve(session, stale_open, true);
+  serve(session, stale_close, true);
   assert(f.frames.empty() && f.errors.empty());
-  session.handle(read(f, replacement, 5, 75, ble::Link::Lan, 1), true);
+  serve(session, read(f, replacement, 5, 75, ble::Link::Lan, 1), true);
   verify_read(f, replacement, 5, 75, 1024, ble::Link::Lan, 1);
   f.clear();
-  session.handle(read(f, lan_handles[2], 80, 32, ble::Link::Lan, 2), true);
+  serve(session, read(f, lan_handles[2], 80, 32, ble::Link::Lan, 2), true);
   verify_read(f, lan_handles[2], 80, 32, 1024, ble::Link::Lan, 2);
   f.clear();
-  session.handle(read(f, ble_handle, 90, 14), true);
+  serve(session, read(f, ble_handle, 90, 14), true);
   verify_read(f, ble_handle, 90, 14, 512);
 
   // Disconnect during a multi-frame READ stops delivery immediately, including
   // READ_END: that frame must never leak into the slot's next connection.
   f.clear();
   f.disconnect_frame = 1;
-  session.handle(read(f, replacement, 0, 3000, ble::Link::Lan, 1), true);
+  serve(session, read(f, replacement, 0, 3000, ble::Link::Lan, 1), true);
   assert(f.frames.size() == 1 && f.frames[0].bytes[0] == ble::kFrameChunk);
   assert(f.errors.empty());
   // The next request reconciles the generation change and drops the stream.
   f.clear();
-  session.handle(read(f, replacement, 0, 10, ble::Link::Lan, 1), true);
+  serve(session, read(f, replacement, 0, 10, ble::Link::Lan, 1), true);
   expect_error(f, ble::kErrBadHandle, ble::Link::Lan, 1);
   assert(descriptor_count() == idle_descriptors + all_slots - 2);
   f.clear();
-  session.handle(read(f, lan_handles[2], 0, 10, ble::Link::Lan, 2), true);
+  serve(session, read(f, lan_handles[2], 0, 10, ble::Link::Lan, 2), true);
   verify_read(f, lan_handles[2], 0, 10, 1024, ble::Link::Lan, 2);
   session.close();
   assert(f.lock_depth == 0);

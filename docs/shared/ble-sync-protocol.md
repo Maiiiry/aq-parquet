@@ -92,7 +92,7 @@ Service data AD (type `0x21`) under the service UUID `c0a5e9f0-0001-…`, in the
 | 6–7 | `boot16` u16 | the last four hex digits of `info.boot`, so a phone notices a reboot (`fin` restarts at 0) |
 | 8–9 | reserved | 0. **Never an IP address or port**: advertisements are unauthenticated, and a forged one would send the phone's LAN token to an attacker's socket. Discovery stays mDNS |
 
-Rules: `new_files` is set when a window closes or a `FLUSH` finalizes a file and cleared when a `LIST` has been answered on any link (that phone now knows the file exists; a phone that then fails its download is covered by its own periodic run). `no_utc` and `clk_restored` are mutually exclusive; both clear after a host `SET_TIME`. Advertising runs in two stages (see [link parameters](#link-parameters-and-notify-flow)): fast (30 to 60 ms) for 30 s after enable, disconnect or a wake, and for 60 s after any flag flips, so a low-power scanner filtering on the flag byte still sees the change within a minute. It is slow (1 to 1.28 s) otherwise. `pixi run ble-sync scan` prints the decoded payload (`adv_ver= flags= fin= boot16=`).
+Rules: `new_files` is set when a window closes or a `FLUSH` finalizes a file and cleared when a `LIST` has been answered on any link and no file finalized during its walk (that phone now knows the file exists; a phone that then fails its download is covered by its own periodic run). `no_utc` and `clk_restored` are mutually exclusive; both clear after a host `SET_TIME`. Advertising runs in two stages (see [link parameters](#link-parameters-and-notify-flow)): fast (30 to 60 ms) for 30 s after enable, disconnect or a wake, and for 60 s after any flag flips, so a low-power scanner filtering on the flag byte still sees the change within a minute. It is slow (1 to 1.28 s) otherwise. `pixi run ble-sync scan` prints the decoded payload (`adv_ver= flags= fin= boot16=`).
 
 ### Link parameters and notify flow
 
@@ -256,7 +256,7 @@ The status JSON remains bounded to 480 bytes. The actual formatter retains every
 
 `ERROR.op` echoes the **first byte of the request** as received, even when that byte is not a known opcode (code 11); an empty write is reported as `op=0x01 code=1 detail="empty"`. `OPENED.name` is the requested name in full; the device does not shorten it (names are ≤ 399 bytes, so on an MTU-517 link every `OPENED` fits one PDU, another reason the phone must negotiate 517). A `FILE` entry whose name would not fit `payload_max − 5` aborts LIST with error 7 (`detail="mtu"`) and is logged on serial as `BLE LIST SKIP`. An archive exceeding the u32 count capacity aborts LIST with error 7 (`detail="count"`). Filesystem enumeration failures (including an SD read failure after earlier entries) abort LIST with error 8. Neither case produces `LIST_END`. Clients commit a replacement listing only after a valid `LIST_END`; preceding `FILE` entries alone are an incomplete snapshot. The device clears its `new_files` hint only after a complete scan and accepted `LIST_END` delivery. `READ_END.next_offset` always equals `offset + bytes actually delivered in CHUNK frames`; a phone that received fewer bytes has lost a notification and must treat the **window** as failed, never trust `next_offset` over its own count, and a failed window is retried with a new `READ` from the phone's own offset, not an aborted sync. Measured 2026-09-17: an Android phone's Bluetooth stack dropped runs of 16 to 18 consecutive notifications at the start of a window while the board's Wi-Fi was active (the same windows reached a Mac intact), so clients should keep reading until that request's `READ_END` before re-issuing, and are advised to use ≤ 4 KiB windows over BLE (16 KiB over LAN).
 
-Error codes: 1 malformed request · 2 invalid name · 3 not a finalized Parquet file · 4 open failed · 5 bad handle · 6 range outside file · 7 busy (command queue full, transfer in progress, or a LIST or READ stopped early so the device can close its open file on a critical battery, retry later) · 8 storage unavailable · 9 invalid epoch (outside 2020 to 2100, or invalid microsecond fraction) · 10 nothing to flush · 11 unknown opcode · 12 invalid config (`detail` = key) · 13 not allowed on this link · 14 authentication failed (LAN handshake) · 15 Wi-Fi unavailable · 16 aborted (proto 3).
+Error codes: 1 malformed request · 2 invalid name · 3 not a finalized Parquet file · 4 open failed · 5 bad handle · 6 range outside file · 7 busy (command queue full, transfer in progress, another LIST running, a LIST ended by a storage remount, or a LIST or READ stopped early so the device can close its open file on a critical battery, retry later) · 8 storage unavailable · 9 invalid epoch (outside 2020 to 2100, or invalid microsecond fraction) · 10 nothing to flush · 11 unknown opcode · 12 invalid config (`detail` = key) · 13 not allowed on this link · 14 authentication failed (LAN handshake) · 15 Wi-Fi unavailable · 16 aborted (proto 3).
 
 Rules:
 
@@ -505,6 +505,10 @@ peer) is still running or queued.
   from the last offset the phone stored.
 - A `LIST` or `READ` queued before the ABORT never starts and answers only
   `ERROR` op code 16.
+- A running `LIST` walks the card in steps of at most 32 directory entries.
+  The worker checks for ABORT before each step and before each `FILE`, so
+  the walk stops within one step, also in a large directory with no
+  finalized file left to send.
 - `ABORTED` follows those errors and names the first op the ABORT stopped, or
   0 when nothing was running. An op stopped on an earlier connection is never
   reported, so a new session sees `4d00`.
@@ -585,6 +589,50 @@ frames. Only the NimBLE host sends BLE notifications. Samples also cross a
 bounded queue, with visible drops when full. Queue depth is a buffer bound,
 not a measured storage-stall budget. The storage worker alone accesses files,
 and board bus locking preserves display/SD ownership and monotonic sampling.
+
+`LIST` runs as a job of bounded steps, at most 32 directory entries each,
+so a large card never holds the worker for a whole walk. Between steps the
+worker takes samples, commits finished batches and serves requests from other
+links and LAN peers. One `LIST` runs at a time. A `LIST` from another link or
+LAN peer gets `ERROR` 7 `detail="list"` at once and should be sent again
+later. Requests from the link or LAN peer that sent the `LIST`, `ABORT`
+included, wait until the `LIST` ends, so replies keep their order and
+`ABORTED` follows the `LIST` error. The first such request waits outside the
+command queue, so requests from other links behind it still run. A second one
+from the same peer waits at the head of the queue and holds requests behind
+it until the `LIST` ends. A phone that sends one request per link at a time,
+plus at most one `ABORT`, never reaches that case, and an `ABORT` ends the
+`LIST` within one step.
+
+A file finalized during the walk may or may not be in that listing, and
+`new_files` then stays set. `LIST_END.partials` is approximate, a `.partial`
+file finalized during the walk can be counted once too often or too few.
+An archive erase or a failed directory read ends the walk with `ERROR` 8. A
+storage remount during the walk ends it with `ERROR` 7 `detail="remount"`,
+because a remount is transient and the phone should retry. A `LIST` sent while
+the card is actually unavailable still gets `ERROR` 8. The device does not
+start its periodic remounts during a `LIST`. A full card is measured without
+a remount until the `LIST` ends, and a card that failed a write is probed
+without a remount, so a `LIST` longer than the 60 s full card recheck still
+completes. The skipped remount runs right after the `LIST`. An owner action,
+such as `FLUSH` or a config change, still remounts at once and may end the
+walk with `ERROR` 7 `detail="remount"`.
+
+When the device needs the storage worker for something more urgent, for
+example closing the open file on a critical battery, the walk ends before its
+next step or `FILE` with `ERROR` 7 `detail="preempted"`. A close that falls
+due between steps ends the `LIST` the same way before the close runs, so the
+close's own remount never reaches a live walk. A `LIST` sent while a close is
+due gets the same reply at once. Send `LIST` again later. On a critical
+battery the device makes up to 8 close attempts with about 91 s of backoff
+between them (1, 2, 4, 8, 16, 30 and 30 s), and each due retry can preempt a `LIST` again. A phone that counts
+each one against its retry budget may give up with link busy before the
+close succeeds. That is accepted, since the board is about to brown out. No
+frame or opcode changed.
+The serial `parquet list` command answers
+`PARQUET ERROR operation=list reason=busy-list` while a radio `LIST` runs,
+because the card has directory handles for one walk only. `parquet get` reads
+one file and still runs.
 
 On LAN the worker never blocks on a socket. It queues frames on the peer's ring and, while the ring is full, waits in short steps during which it moves queued samples into the RAM batch when that needs no card write.
 

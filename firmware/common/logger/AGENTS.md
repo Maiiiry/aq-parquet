@@ -24,6 +24,9 @@ initialization and each board's schema/provenance remain in its own trial.
   high-water marks and `DIAG heap` (internal, DMA, PSRAM) 60 s after begin,
   then hourly.
 - The worker is a task watchdog user (`CONFIG_AQ_LOGGER_WORKER_WDT`, 60 s).
+  A radio LIST runs as bounded `ArchiveSession::step()` calls from the worker
+  loop, one per pass after samples and commits. Never walk a whole tree for a
+  radio request in one call.
   Any new loop or walk on the worker calls `stamp_heartbeat()` per entry, and
   any new blocking board hook is stamped on both sides. Writer code stamps only
   after confirmed progress, never before a call that may hang. Keep the
@@ -44,7 +47,10 @@ initialization and each board's schema/provenance remain in its own trial.
   `storage_governor.h`; boards only supply the free, cluster and remount hooks.
 - Startup archive scans must not print each filename. Retain a bounded summary
   so offline startup does not depend on a USB reader draining archive output.
-  Explicit serial `parquet list` still emits entries and its END marker.
+  Explicit serial `parquet list` still emits entries and its END marker. It
+  is refused while a radio `LIST` job runs, since the FATFS lock budget covers
+  one walk. Keep the job's worker decisions pure in `aq_logger_list_job.h`,
+  and never start a periodic remount while a `LIST` job runs.
 - Board metadata must describe its hardware honestly. PMS5003T has four particle
   bins and ambient temperature/humidity; do not synthesize CoreS3-only bins.
 - Copy the coarsened location settings at acquisition into the queued sample.

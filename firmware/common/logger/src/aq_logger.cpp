@@ -2,6 +2,7 @@
 #include "aq_logger_archive_reset.h"
 #include "aq_logger_directory.h"
 #include "aq_logger_emergency_close.h"
+#include "aq_logger_list_job.h"
 #include "aq_logger_live.h"
 #include "aq_logger_location.h"
 #include "aq_logger_power.h"
@@ -175,8 +176,9 @@ std::atomic<std::uint8_t> sd_state{
     static_cast<std::uint8_t>(storage::State::Retry)};
 std::uint32_t quarantine_counter = 0; // unique per boot
 // Advertising bit `new_files`: set when a file finalizes, cleared when a LIST
-// has been answered on any link (that phone now knows; a phone that then fails
-// its download is covered by its periodic run).
+// has been answered on any link and no file finalized during its walk (that
+// phone now knows, and a phone that then fails its download is covered by its
+// periodic run).
 // docs/shared/ble-sync-protocol.md.
 std::atomic<bool> unlisted_files{false};
 std::int64_t boot_hi = 0, boot_lo = 0, device = 0, next_sample_us = 0;
@@ -457,6 +459,9 @@ struct ArchiveDirectoryIO {
     errno = 0;
     return ::readdir(directory);
   }
+  // FatFs stat() looks the name up again from the start of its directory,
+  // so a directory of n entries costs about n squared entry reads. Fine at
+  // the 96 files of a day folder.
   static int inspect(const char *path, struct stat *info) {
     BusLock lock;
     return ::stat(path, info);
@@ -891,41 +896,122 @@ bool write_benchmark(std::size_t count, Codec codec) {
 bool safe_name(const char *name) { return aq::sync::safe_parquet_name(name); }
 
 // One finalized-file entry from a listing. `name` already carries the export
-// prefix ("legacy-parquet/" for the pre-Hive directory).
-using FileEmitter = void (*)(void *context, const char *name,
-                             std::uint32_t bytes);
+// prefix ("legacy-parquet/" for the pre-Hive directory). False stops the walk.
+using FileEmitter = aqsync::FileEmitter;
 
-void emit_file_serial(void *, const char *name, std::uint32_t bytes) {
+bool emit_file_serial(void *, const char *name, std::uint32_t bytes) {
   aqlog.printf("PARQUET FILE name=%s bytes=%lu\n", name,
                static_cast<unsigned long>(bytes));
+  return true;
 }
 
-bool list_directory(unsigned &partials, FileEmitter emit, void *context,
-                    const char *base = kDirectory,
-                    const char *export_prefix = "") {
-  ArchiveDirectoryIO io;
-  auto visit = [&](const char *name, const struct stat &info) {
-    if (S_ISREG(info.st_mode) && safe_name(name)) {
-      if (info.st_size < 0 ||
-          static_cast<std::uint64_t>(info.st_size) > UINT32_MAX) {
-        errno = EOVERFLOW;
-        return false;
-      }
-      char exported[400];
-      const int length = std::snprintf(exported, sizeof(exported), "%s%s",
-                                       export_prefix, name);
-      if (length < 0 || static_cast<std::size_t>(length) >= sizeof(exported)) {
-        errno = ENAMETOOLONG;
-        return false;
-      }
-      emit(context, exported, static_cast<std::uint32_t>(info.st_size));
-    } else if (std::strstr(name, ".partial") && partials != UINT32_MAX) {
-      ++partials;
+// Walks the main archive tree, then the legacy tree, in bounded steps. Only a
+// complete scan replaces the partial counter. Holds its directories open
+// between steps until it ends or cancel() runs.
+class ArchiveList {
+public:
+  aqsync::ListStatus step(bool start, unsigned budget, FileEmitter emit,
+                          void *context, unsigned &partials) {
+    if (start) {
+      cancel();
+      finalized_at_start_ = finalized.load();
+      if (!walk_.begin(io_, kDirectory))
+        return fail();
     }
-    return true;
-  };
-  return aq::logger::detail::walk_directory(io, base, "", 0, visit);
-}
+    const char *prefix = legacy_ ? "legacy-parquet/" : "";
+    bool bad_entry = false;
+    auto visit = [&](const char *name, const struct stat &info) {
+      if (S_ISREG(info.st_mode) && safe_name(name)) {
+        if (info.st_size < 0 ||
+            static_cast<std::uint64_t>(info.st_size) > UINT32_MAX) {
+          errno = EOVERFLOW;
+          bad_entry = true;
+          return false;
+        }
+        char exported[400];
+        const int length =
+            std::snprintf(exported, sizeof(exported), "%s%s", prefix, name);
+        if (length < 0 ||
+            static_cast<std::size_t>(length) >= sizeof(exported)) {
+          errno = ENAMETOOLONG;
+          bad_entry = true;
+          return false;
+        }
+        return emit(context, exported,
+                    static_cast<std::uint32_t>(info.st_size));
+      }
+      if (std::strstr(name, ".partial") && partials != UINT32_MAX)
+        ++partials;
+      return true;
+    };
+    using Walk = aq::logger::detail::DirectoryWalk<ArchiveDirectoryIO>;
+    const auto status = walk_.step(budget, visit);
+    if (status == Walk::Status::More)
+      return aqsync::ListStatus::More;
+    if (status == Walk::Status::Failed || bad_entry)
+      return fail();
+    if (status == Walk::Status::Stopped) {
+      cancel();
+      return aqsync::ListStatus::Stopped;
+    }
+    if (!legacy_ && config.legacy_directory) {
+      legacy_ = true;
+      struct stat legacy{};
+      int stat_result;
+      int stat_error;
+      {
+        BusLock lock;
+        stat_result = ::stat(config.legacy_directory, &legacy);
+        stat_error = errno;
+      }
+      if (stat_result == 0) {
+        if (!S_ISDIR(legacy.st_mode)) {
+          errno = ENOTDIR;
+          return fail();
+        }
+        // The legacy tree starts on the next step.
+        if (!walk_.begin(io_, config.legacy_directory))
+          return fail();
+        return aqsync::ListStatus::More;
+      }
+      if (stat_error != ENOENT) {
+        errno = stat_error;
+        return fail();
+      }
+    }
+    cancel();
+    partials_seen = partials;
+    return aqsync::ListStatus::Complete;
+  }
+
+  void cancel() {
+    walk_.cancel();
+    legacy_ = false;
+  }
+
+  // True when no file finalized since the walk started. Steps let commits
+  // run mid walk, and a file finalized then may sit behind the walk's cursor.
+  bool saw_every_finalized() const {
+    return finalized.load() == finalized_at_start_;
+  }
+
+private:
+  aqsync::ListStatus fail() {
+    const int failure = errno;
+    cancel();
+    ++errors;
+    aqlog.printf("PARQUET ERROR operation=list errno=%d\n", failure);
+    return aqsync::ListStatus::Failed;
+  }
+
+  aq::logger::detail::DirectoryWalk<ArchiveDirectoryIO> walk_;
+  ArchiveDirectoryIO io_;
+  std::uint32_t finalized_at_start_ = 0;
+  bool legacy_ = false;
+};
+
+// The radio LIST job's walk. Only the storage worker touches it.
+ArchiveList archive_list;
 
 bool partial_name(const char *name) {
   const std::size_t length = std::strlen(name);
@@ -1027,40 +1113,15 @@ unsigned quarantine_partials() {
   return quarantined;
 }
 
-// Walk every configured archive tree; only a complete scan replaces counters.
-aqsync::ListResult list_all(FileEmitter emit, void *context) {
-  aqsync::ListResult result;
-  result.complete = list_directory(result.partials, emit, context);
-  if (result.complete && config.legacy_directory) {
-    struct stat legacy{};
-    int stat_result;
-    int stat_error;
-    {
-      BusLock lock;
-      stat_result = ::stat(config.legacy_directory, &legacy);
-      stat_error = errno;
-    }
-    if (stat_result == 0) {
-      if (S_ISDIR(legacy.st_mode)) {
-        result.complete =
-            list_directory(result.partials, emit, context,
-                           config.legacy_directory, "legacy-parquet/");
-      } else {
-        errno = ENOTDIR;
-        result.complete = false;
-      }
-    } else if (stat_error != ENOENT) {
-      errno = stat_error;
-      result.complete = false;
-    }
-  }
-  if (result.complete) {
-    partials_seen = result.partials;
-  } else {
-    ++errors;
-    aqlog.printf("PARQUET ERROR operation=list errno=%d\n", errno);
-  }
-  return result;
+// Walks every configured archive tree in one call, for the serial listing
+// and the startup scan. True only for a complete scan.
+bool list_all(FileEmitter emit, void *context, unsigned &partials) {
+  ArchiveList list;
+  constexpr unsigned kBudget = 1024;
+  auto status = list.step(true, kBudget, emit, context, partials);
+  while (status == aqsync::ListStatus::More)
+    status = list.step(false, kBudget, emit, context, partials);
+  return status == aqsync::ListStatus::Complete;
 }
 
 void list_files(bool emit_serial = true) {
@@ -1070,13 +1131,12 @@ void list_files(bool emit_serial = true) {
     auto &files = *static_cast<std::uint32_t *>(context);
     if (files != UINT32_MAX)
       ++files;
+    return true;
   };
-  const aqsync::ListResult result =
-      list_all(emit_serial ? emit_file_serial : count_file,
-               emit_serial ? nullptr : &count);
-  if (!result.complete)
+  unsigned partials = 0;
+  if (!list_all(emit_serial ? emit_file_serial : count_file,
+                emit_serial ? nullptr : &count, partials))
     return;
-  const unsigned partials = result.partials;
   if (!emit_serial) {
     // Startup must not wait for a USB reader to drain an archive-sized dump.
     // Enumeration/stats still run on this worker with the same bus ownership.
@@ -1388,6 +1448,9 @@ void publish_live(const Sample &row) {
 
 // The request being executed; handlers answer on its link, peer and generation.
 const ble::ControlRequest *current_request = nullptr;
+// The ABORT stamp of the request or LIST step being executed, or nullptr. A
+// LIST step has no request, only the job's stamp.
+const aqsync::abort::Tag *current_abort = nullptr;
 
 std::uint32_t link_generation(ble::Link link, std::uint8_t peer = 0) {
   return link == ble::Link::Lan ? lan::connection_generation(peer)
@@ -1420,10 +1483,9 @@ void *wait_context(const std::uint8_t *frame, std::size_t length) {
 }
 bool data_wait_step(void *context) {
   error_wait_step(context);
-  return power::keep_waiting(emergency_close,
-                             current_request &&
-                                 aqsync::abort::pending(*current_request),
-                             context != nullptr, uptime_ms());
+  return power::keep_waiting(
+      emergency_close, current_abort && aqsync::abort::pending(*current_abort),
+      context != nullptr, uptime_ms());
 }
 bool lan_deliver(const std::uint8_t *frame, std::size_t length,
                  std::uint8_t peer, std::uint32_t generation) {
@@ -1462,8 +1524,9 @@ bool respond_error(ble::Op op, ble::Error code, const char *detail) {
 // frames are shared across boards and BLE/LAN transports.
 aqsync::ArchiveSession archive_session(
     {nullptr,
-     [](void *, aqsync::FileEmitter emit, void *context) {
-       return list_all(emit, context);
+     [](void *, bool start, unsigned budget, aqsync::FileEmitter emit,
+        void *context, unsigned &partials) {
+       return archive_list.step(start, budget, emit, context, partials);
      },
      [](void *, const char *name, char *path, std::size_t size) {
        return resolve_path(name, path, size);
@@ -1474,7 +1537,10 @@ aqsync::ArchiveSession archive_session(
      [](void *) { return total_kib.load(); },
      [](void *) { return used_kib.load(); },
      [](void *) {
-       unlisted_files = false;
+       // A file finalized during the walk keeps new_files set, since this
+       // listing may not include it.
+       if (archive_list.saw_every_finalized())
+         unlisted_files = false;
        publish_advert();
      },
      [](void *) { lock_bus(); }, [](void *) { unlock_bus(); },
@@ -1482,7 +1548,12 @@ aqsync::ArchiveSession archive_session(
      [](void *, std::size_t slot) -> void * {
        return writer_state->read_buffers[slot];
      },
-     [](void *) { return std::int64_t(esp_timer_get_time()); }},
+     [](void *) { return std::int64_t(esp_timer_get_time()); },
+     [](void *) { archive_list.cancel(); },
+     // A due critical battery close ends a LIST job before its next step or
+     // FILE. CHUNK frames and ring waits stop through the transfer gate,
+     // which reads the same close (aq_logger_transfer_gate.h).
+     [](void *) { return emergency_close.preempt(uptime_ms()); }},
     {nullptr,
      [](void *, ble::Link link, std::uint8_t peer) {
        return link_generation(link, peer);
@@ -1493,9 +1564,9 @@ aqsync::ArchiveSession archive_session(
      },
      [](void *, ble::Link link, std::uint8_t peer, std::uint32_t generation,
         const std::uint8_t *frame, std::size_t length) {
-       // A due critical battery close stops a LIST or READ at its next data
-       // frame. The session ends it with the existing busy error and the
-       // client retries after the worker has closed the file.
+       // A due critical battery close stops a READ at its next CHUNK with
+       // READ_END busy. LIST frames pass, since the session's preempted
+       // hook already ends the job before each FILE.
        if (power::refuses_frame(emergency_close, frame, length, uptime_ms()))
          return false;
        return link == ble::Link::Lan
@@ -1668,16 +1739,19 @@ bool files_closed() {
 
 // Remount (when the board allows it) and re-measure. Clears Retry only when
 // the card answers and, with rows waiting, a write succeeds again.
-void probe_storage(std::size_t &count, bool &storage_ready) {
+// With remount false the probe keeps the mount and only measures and writes.
+void probe_storage(std::size_t &count, bool &storage_ready,
+                   bool remount = true) {
   const auto previous = governor.state();
   const auto now = uptime_seconds();
   bool mounted_again = false;
-  bool ok = storage_ready || hooks.storage_remount;
+  const bool may_remount = remount && hooks.storage_remount;
+  bool ok = storage_ready || may_remount;
   // An open file is finalized (or closed and quarantined by close_failed on
   // error) so no FILE* outlives the mount.
-  if (ok && hooks.storage_remount && writer_state->telemetry.open())
+  if (ok && may_remount && writer_state->telemetry.open())
     finalize_file(writer_state->telemetry);
-  if (ok && hooks.storage_remount && files_closed()) {
+  if (ok && may_remount && files_closed()) {
     // A remount may follow an external card edit, so cached CRCs go too.
     archive_session.remounted();
     writer_state->crc_cache.clear();
@@ -1720,21 +1794,33 @@ void probe_storage(std::size_t &count, bool &storage_ready) {
 }
 
 // Runs due probes and the 60 s free-space recheck while not Ready. A Full
-// card is remounted so space freed on a PC becomes visible.
-void service_storage(std::size_t &count, bool &storage_ready) {
+// card is remounted so space freed on a PC becomes visible. While a radio
+// LIST job runs a periodic remount waits for it (aq_logger_list_job.h).
+// `owner` marks an owner action or the emergency close, which remounts at
+// once even if that ends the job.
+listjob::StoragePlanner storage_planner;
+void service_storage(std::size_t &count, bool &storage_ready,
+                     bool owner = false) {
   const auto now = uptime_seconds();
-  if (governor.probe_due(now) && (storage_ready || hooks.storage_remount)) {
-    probe_storage(count, storage_ready);
+  const auto state = governor.state();
+  listjob::StorageInputs in;
+  in.probe_due = governor.probe_due(now);
+  in.can_probe = storage_ready || hooks.storage_remount;
+  in.recheck_due = governor.recheck_due(now);
+  in.full = state == storage::State::Full;
+  in.retry = state == storage::State::Retry;
+  in.remount = hooks.storage_remount != nullptr;
+  in.files_closed = files_closed();
+  in.listing = archive_session.listing();
+  in.owner = owner;
+  const auto pass = storage_planner.next(in);
+  if (pass == listjob::StoragePass::Idle)
+    return;
+  if (pass != listjob::StoragePass::Recheck) {
+    probe_storage(count, storage_ready, pass == listjob::StoragePass::Probe);
     return;
   }
-  if (!governor.recheck_due(now))
-    return;
-  const auto previous = governor.state();
-  if (previous == storage::State::Full && hooks.storage_remount &&
-      files_closed()) {
-    probe_storage(count, storage_ready);
-    return;
-  }
+  const auto previous = state;
   std::uint64_t free_bytes = 0;
   if (measure_free(free_bytes))
     governor.observe_free(free_bytes, now);
@@ -1746,7 +1832,7 @@ void service_storage(std::size_t &count, bool &storage_ready) {
 // Explicit owner actions retry at once instead of waiting for the backoff.
 bool storage_writable(std::size_t &count, bool &storage_ready) {
   governor.request_probe();
-  service_storage(count, storage_ready);
+  service_storage(count, storage_ready, true);
   return storage_ready && governor.writable();
 }
 
@@ -1798,6 +1884,10 @@ void flush_batch(std::size_t &count, bool &storage_ready) {
 // file finalized during the attempt, including one the storage probe closed.
 void service_emergency_close(std::size_t &count, bool &storage_ready) {
   const auto now = uptime_ms();
+  // A due close first ends a running LIST with ERROR busy "preempted", so
+  // its Retry remount never reaches a live walk. A request() landing after
+  // this check still ends the LIST through the remount, as busy "remount".
+  listjob::preempt_for_close(archive_session, emergency_close, now);
   const std::uint32_t finalized_before = finalized.load();
   CloseStorage storage{count, storage_ready};
   const auto pass = power::service(emergency_close, storage, now);
@@ -1956,6 +2046,26 @@ void handle_control_request(const ble::ControlRequest &request,
   }
 }
 
+// The one request the running LIST job holds back, outside the queue.
+struct ParkedRequest {
+  ble::ControlRequest request{};
+  bool waiting = false;
+};
+ParkedRequest parked;
+
+void serve_control(const ble::ControlRequest &request, std::size_t &count,
+                   bool &storage_ready) {
+  WorkerState state{count, storage_ready};
+  const auto stamp = aqsync::abort::tag(request);
+  current_request = &request;
+  current_abort = &stamp;
+  active_state = &state;
+  handle_control_request(request, state);
+  active_state = nullptr;
+  current_abort = nullptr;
+  current_request = nullptr;
+}
+
 void storage_worker(void *) {
   // Startup scans below are covered from the first instruction.
   stamp_heartbeat();
@@ -2015,12 +2125,51 @@ void storage_worker(void *) {
     // otherwise drop every later sample. A failed commit leaves writable().
     if (count >= rows_per_group() && storage_ready && governor.writable())
       governed_commit(count, false);
-    if (xQueueReceive(commands, &command, 0) != pdTRUE) {
-      // Drain pending samples before sleeping. Queue-then-signal also covers
-      // an enqueue racing this check: the signal remains pending until taken.
-      work::wait_if_idle(samples, worker_wakeup);
+    // One bounded LIST step per pass, after samples and commits, so a large
+    // card never holds the worker for a whole walk. The walk's reads stamp
+    // the heartbeat, a stuck peer is bounded by its deliver wait.
+    if (archive_session.listing()) {
+      WorkerState state{count, storage_ready};
+      active_state = &state;
+      current_abort = archive_session.list_tag();
+      archive_session.step(storage_ready);
+      current_abort = nullptr;
+      active_state = nullptr;
+    }
+    // A request the job holds back moves to the parked slot, so requests
+    // behind it from other links still run between steps
+    // (aq_logger_list_job.h).
+    const bool listing = archive_session.listing();
+    const bool has_head = xQueuePeek(commands, &command, 0) == pdTRUE;
+    const auto take =
+        listjob::take(listing, parked.waiting, has_head,
+                      has_head && command.source == Command::Source::Control &&
+                          archive_session.must_wait_for_list(command.control));
+    if (take == listjob::Take::Wait) {
+      if (listing) {
+        // One tick per step, so a walk of cached entries into a ring with
+        // room still lets IDLE run for the task watchdog.
+        vTaskDelay(1);
+      } else {
+        // Drain pending samples before sleeping. Queue-then-signal also
+        // covers an enqueue racing this check: the signal remains pending
+        // until taken.
+        work::wait_if_idle(samples, worker_wakeup);
+      }
       continue;
     }
+    if (take == listjob::Take::Park) {
+      xQueueReceive(commands, &command, 0);
+      parked.request = command.control;
+      parked.waiting = true;
+      continue;
+    }
+    if (take == listjob::Take::Parked) {
+      parked.waiting = false;
+      serve_control(parked.request, count, storage_ready);
+      continue;
+    }
+    xQueueReceive(commands, &command, 0);
     if (command.source == Command::Source::Network) {
       const auto &anchor = command.network_time;
       if (set_clock(anchor.seconds, anchor.monotonic_us, aq::utc::Network,
@@ -2034,12 +2183,7 @@ void storage_worker(void *) {
       continue;
     }
     if (command.source == Command::Source::Control) {
-      WorkerState state{count, storage_ready};
-      current_request = &command.control;
-      active_state = &state;
-      handle_control_request(command.control, state);
-      active_state = nullptr;
-      current_request = nullptr;
+      serve_control(command.control, count, storage_ready);
       continue;
     }
     if (std::strcmp(command.text, "parquet erase-archive CONFIRM") == 0) {
@@ -2086,6 +2230,7 @@ void storage_worker(void *) {
       worker_failed = !erased;
       xQueueReset(samples);
       xQueueReset(commands);
+      parked.waiting = false;
       if (erased) {
         partials_seen = partials_quarantined = 0;
         quarantine_bytes = 0;
@@ -2240,6 +2385,10 @@ void storage_worker(void *) {
       }
       report_host_clock("serial", seconds, mono, previous, skew_ns);
       publish_status();
+    } else if (listjob::serial_walks_archive(command.text) &&
+               archive_session.listing()) {
+      // A second walk would need a second set of directory handles.
+      aqlog.println("PARQUET ERROR operation=list reason=busy-list");
     } else if (std::strcmp(command.text, "parquet list") == 0)
       list_files();
     else if (std::strncmp(command.text, "parquet get ", 12) == 0)

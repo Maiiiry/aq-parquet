@@ -8,6 +8,48 @@ lives in [ble-sync-protocol.md](ble-sync-protocol.md). Files already on a phone
 or SD card are never rewritten by the firmware, so the app must keep reading
 the older shapes it has stored, or the owner clears them.
 
+## ABORT stops a LIST within one step (fix/33-abort-list-walk)
+
+**What changed.** The device walks the card for `LIST` in steps of at most 32
+directory entries and checks for ABORT before each step and each `FILE`. An
+ABORT now stops a `LIST` within one step, even on a large card. Before, the
+walk only stopped at the next `FILE`, and the whole walk ran first. The reply
+is unchanged, `FILE` frames already sent, then `ERROR` 16, then `ABORTED`
+naming `LIST`. Other links and LAN peers are served between steps. A file
+finalized during the walk may be missing from that listing, and `new_files`
+then stays set in the advert. `LIST_END.partials` is approximate when a
+`.partial` file is finalized during the walk. Only one `LIST` runs at a time,
+and a `LIST` from another link or LAN peer now gets `ERROR` 7 `detail="list"`
+at once instead of waiting for the running one. A full card no longer
+remounts during a `LIST`, so a long walk is not cut off every 60 s. A remount
+that still ends a `LIST`, for example after `FLUSH` or a config change, now
+answers `ERROR` 7 `detail="remount"` instead of `ERROR` 8, because the card
+comes back and the app should retry. An erase or a directory read failure
+still answers `ERROR` 8. When the device needs its storage worker for
+something more urgent, such as a critical battery close, the walk ends early
+with `ERROR` 7 `detail="preempted"` instead of after the whole walk, and a
+`LIST` sent while that close is due gets the same reply at once. No frame
+layout, opcode or error code changed.
+
+**Why.** On a large card the abort drain could outrun the app's bound of 4096
+frames, 4 MiB or 30 s and close the link with `DrainExceeded`. A long walk
+also held the storage worker away from samples and the watchdog heartbeat.
+
+**What the app must do.** Nothing. `LinkSession` already accepts any number of
+`FILE` frames, then `ERROR` 16 and `ABORTED` in either order, and only checks
+that the `FILE` count matches `LIST_END.count`. The drain now ends sooner.
+A preempted `LIST` is `ERROR` 7, which `DeviceSession` already maps to
+`DeviceBusyException`, and `CollectionController` retries it after its
+backoff like any busy reply. The same holds for the `detail="list"` busy
+reply, which an app syncing over BLE and LAN at once can see on its second
+link, and for `detail="remount"`. Before, a `LIST` cut by a remount ended the
+collection as a device failure with no retry. The `DeviceBusyException` KDoc
+should list the LIST details `preempted`, `list` and `remount`. On a critical
+battery the device makes up to 8 close attempts with about 91 s of backoff
+between them, and each retry can preempt a `LIST` again, so the app can spend its 5 attempt
+retry budget and end with link busy. That is accepted on a dying battery and
+needs no app change.
+
 ## CoreS3 LIVE keys covered by the dictionary digest (CoreS3 v6.13, issue #31)
 
 - CoreS3 LIVE keys now live in `telemetry_fields.inc` as the last `FIELD`
