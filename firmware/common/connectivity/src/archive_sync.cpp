@@ -116,6 +116,47 @@ void ArchiveSession::release_files() {
     release(opened);
 }
 
+void ArchiveSession::remounted() {
+  mounted_ = false;
+  for (auto &opened : open_) {
+    release(opened);
+    if (opened.handle)
+      opened.verify = true;
+  }
+}
+
+// Runs on the stream read() just reopened, still at offset 0. A handle names
+// the bytes OPENED described, never whatever now sits at its path. Only a
+// completed check proves a change. An I/O error keeps the recheck pending.
+ArchiveSession::Recheck ArchiveSession::reverify(OpenFile &opened) {
+  const std::int64_t started =
+      archive_.now_us ? archive_.now_us(archive_.context) : 0;
+  FileCheck check;
+  const bool finalized =
+      archive_.finalized(archive_.context, opened.path, opened.file, check);
+  Recheck result = Recheck::Same;
+  if (!finalized)
+    result = check.io_error ? Recheck::Unreadable : Recheck::Changed;
+  else if (check.size != opened.size || check.crc != opened.crc)
+    result = Recheck::Changed;
+  if (archive_.log) {
+    const std::int64_t elapsed =
+        archive_.now_us ? archive_.now_us(archive_.context) - started : -1;
+    char line[112];
+    std::snprintf(line, sizeof(line),
+                  "BLE READ RECHECK handle=%u result=%s check_us=%lld\n",
+                  unsigned(opened.handle),
+                  result == Recheck::Same      ? "same"
+                  : result == Recheck::Changed ? "changed"
+                                               : "io_error",
+                  static_cast<long long>(elapsed));
+    archive_.log(archive_.context, line);
+  }
+  if (result == Recheck::Same)
+    opened.verify = false;
+  return result;
+}
+
 void ArchiveSession::reconcile() {
   for (std::size_t i = 0; i < open_.size(); ++i) {
     auto &opened = open_[i];
@@ -327,11 +368,25 @@ void ArchiveSession::read(std::uint16_t file_handle, std::uint32_t offset,
   const std::size_t chunk_max =
       max_payload - 7 > kChunkCap ? kChunkCap : max_payload - 7;
   // Only the storage worker accesses files. The handle's descriptor stays
-  // open across READ windows. After release_files() or a read failure the
-  // path is reopened here.
-  if (!opened.file) {
+  // open across READ windows. After release_files(), remounted() or a read
+  // failure the path is reopened here. After a remount the reopened file must
+  // still be the one OPENED described, or the handle is gone. Only proof of a
+  // change ends it. An unmounted volume or an I/O error leaves the stream
+  // closed, so READ_END status 4 below keeps the recheck pending.
+  if (!opened.file && !(opened.verify && !mounted_)) {
     int failure = 0;
     opened.file = open_input(opened.path, slot(), failure);
+    const Recheck recheck = !opened.verify      ? Recheck::Same
+                            : opened.file       ? reverify(opened)
+                            : failure == ENOENT ? Recheck::Changed
+                                                : Recheck::Unreadable;
+    if (recheck == Recheck::Changed) {
+      close_current();
+      error(ble::kOpRead, ble::kErrBadHandle);
+      return;
+    }
+    if (recheck == Recheck::Unreadable)
+      release(opened);
   }
   bool seek_ok = false;
   if (opened.file) {
