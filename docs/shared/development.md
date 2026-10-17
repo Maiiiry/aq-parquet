@@ -115,24 +115,76 @@ conditionals or sibling trial dependencies.
 
 ## Verification
 
-Every firmware PR runs the baseline below and builds both boards. Use cached
+Every firmware PR runs the host gate and builds both boards. Use cached
 build directories and the pinned Pixi environment. Run additional gates for the
 changed subsystem. Preserve vendored bytes and licenses. Generic fixtures never
 get flashed.
 
 ```sh
-pixi run fmt-check
-pixi run lint
-pixi run common-test
-pixi run telemetry-contract-test --sanitize
-pixi run archive-sync-test
-pixi run control-sync-test
-pixi run wifi-link-test
-pixi run logger-status-test
+pixi run gate
 pixi run connectivity-build-test
 pixi run cores3-build
 pixi run waveshare-build
 ```
+
+`pixi run gate` runs `tools/gate.sh`. It runs `fmt-check`, `lint` and every
+host contract and fixture task in a fixed list, with ASan and UBSan wherever
+the task supports `--sanitize`. It stops at the first failure and prints which
+task failed. Pass `--keep-going` to run the whole list and see every failure.
+Tasks that need a board, a serial port, Bluetooth, a LAN peer or the ESP-IDF
+SDK are not in the gate. Add a new host test task to that list when you add it
+to `pixi.toml`. The clang, clang-format and cppcheck used by the gate come from
+exact Pixi pins on macOS and Linux, so local runs and CI see the same tools.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request, on pushes to `main`,
+and by hand from the Actions tab (`workflow_dispatch`).
+
+- **Workflow lint** runs `actionlint` (with `shellcheck`) and `zizmor` on
+  `.github/` at exact conda-forge pins through `pixi exec`. Run the same
+  commands locally before changing a workflow.
+- **Host gate** runs `pixi run gate --keep-going` on Ubuntu with the locked
+  Pixi environment. Each task runs under GNU `timeout` from the Pixi
+  `coreutils` pin, 600 s by default (`AQ_GATE_TASK_TIMEOUT` overrides it), and
+  a stalled task is reported as `TIMEOUT` by name in the gate summary. The
+  gate refuses to start when a `*-test` task in `pixi.toml` is missing from its
+  list, except the two SDK fixtures the board job runs.
+- **Board builds** run `pixi run idf-setup`, then `cores3-build`,
+  `waveshare-build logger`, `waveshare-build diagnostic`, and the generic
+  `connectivity-build-test` and `logger-build-test` fixtures. The SDK comes
+  from the same `setup-idf.sh` path developers use, so CI builds exactly the
+  commit in `tools/idf-dependencies.lock`. The SDK and ccache caches are
+  restored on every run but written only by pushes to `main`, and the SDK is
+  saved from the cores3 leg alone, so pull requests never evict the `main`
+  entries. `waveshare-psram-build` stays a manual SDK fixture.
+- Each board job uploads its `idf.py size --format json2` report and
+  `aq-build-sha256.json` as the `size-<board>` artifact, and the ELF, map and
+  `flash_args` as `firmware-<board>`. Both are kept 90 days for `main` builds
+  and 7 days otherwise. The job summary shows a size table. For a pull request
+  the change is measured against the green build of its base commit, else
+  against the newest green `main` build, and the summary names which commit
+  was used.
+- **CI result** waits for every other job and fails unless each one passed or
+  was skipped. It is the single required check.
+- Dependabot opens one grouped pull request a week for action pin updates,
+  only for releases at least 7 days old (`.github/dependabot.yml`).
+
+CI proves compilation and host logic only. It never flashes a board, and board
+runs stay manual and dated in each bench record. Every action is pinned to a
+full commit SHA. Check the latest stable release before changing a pin.
+
+#### Required checks
+
+Make only `CI result` required for `main`. In Settings, Rules, Rulesets, open
+or create the `main` branch ruleset, enable Require status checks to pass, add
+`CI result` with the source set to GitHub Actions, and save.
+
+`CI result` needs every other job, so jobs and board matrix entries can be
+added or renamed without a ruleset change. A new job must be added to its
+`needs` list, or its failure will not block a merge. Keep the job name
+`CI result` stable. If a merge queue is enabled later, add a `merge_group`
+trigger to the workflow at the same time.
 
 | Changed area | Additional Pixi tasks |
 | --- | --- |
