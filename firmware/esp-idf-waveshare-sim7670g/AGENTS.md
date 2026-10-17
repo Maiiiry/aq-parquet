@@ -29,12 +29,20 @@ pinned ESP-IDF toolchain, component manifests and partition files. Never borrow 
   power pins or change USB routing/DIP switches for the logger.
 - The owner subsequently installed an 18650 and verified battery-only boot.
   `kBatteryInstalled` is the explicit board configuration; a MAX17048 response
-  still cannot prove battery presence. Read failures leave battery fields null.
+  still cannot prove battery presence. A failed register nulls only its own
+  columns. A good VCELL with a bad SOC still writes `battery_mv` and drives
+  `battery_health_state`, which is always written and reads 0 when unknown.
   Charger state has no verified ESP32 signal. No external RTC: UTC remains null until a real host or network anchor,
   and a reboot starts a new unanchored clock epoch.
-- Current firmware is `idf-waveshare-parquet-v2.6`, schema v4/dictionary v4
-  with 56 fields. Preserve the original 52-field order. Field ids are the
-  1-based `telemetry_fields.inc` position, so only append fields. Shared H3 helpers
+- Current firmware is `idf-waveshare-parquet-v2.7`, schema v5/dictionary v5
+  with 62 fields. Fields 57 to 62 hold MAX17048 diagnostics and the shared
+  `power/` battery health state. Battery thresholds live in
+  `telemetry_contract.h` (`kBatteryThresholds`) and are uncalibrated until a
+  dated discharge run. VCELL senses the VBAT rail, so external power is only
+  inferred. The gauge ALRT pin is tied to ground, so never rely on alerts. Preserve the original 52-field order. Field ids are the
+  1-based `telemetry_fields.inc` position, so only append fields. LIVE keys are
+  the last `FIELD` argument ("" stays off LIVE), so the dictionary digest covers
+  them and any change needs a matching mobile app release. Shared H3 helpers
   publish only the owner-configured coarsened station cell and its center;
   country is optional and owner-declared. Do not turn on modem GNSS for this.
 - Fixed pairing PIN is random per device. Retrieve it only through the
