@@ -6,6 +6,8 @@
 #include "aq_logger_provision.h"
 #include "aq_logger_rotation.h"
 #include "aq_logger_status.h"
+#include "aq_logger_watchdog.h"
+#include "aq_logger_watchdog_apply.h"
 #include "aq_logger_work_queue.h"
 #include "crc_cache.h"
 #include "debug_log.h"
@@ -24,10 +26,12 @@
 #include <utc_clock.h>
 
 #include "aq_console.h"
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
 #include <esp_random.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -120,7 +124,9 @@ struct WriterState {
   Sample rows[kMaxRows];
   Column columns[telemetry::kMaxColumns];
   OutputFile telemetry;
-  OutputFile benchmark; // codec-test copies never touch the telemetry file
+  // codec-test copies never touch the telemetry file. The benchmark file is
+  // allocated from PSRAM only while codec-test runs and is null otherwise.
+  OutputFile *benchmark = nullptr;
   Lz4Workspace lz4{};
   // Archive reads. Finalize-time CRCs for OPEN, the CRC read block and one
   // stdio buffer per persistent archive read handle. Worker only.
@@ -170,9 +176,24 @@ std::atomic<bool> unlisted_files{false};
 std::int64_t boot_hi = 0, boot_lo = 0, device = 0, next_sample_us = 0;
 std::int64_t sample_sequence = 0;
 std::atomic<std::int64_t> missed_deadlines{0};
-// Worker liveness: the loop stamps this every pass; poll warns when it
-// stops moving, so a wedged worker is visible on serial instead of silent.
+// Worker liveness: the loop and every long walk stamp this; poll warns when
+// it stops moving for 5 s, and the watchdog supervisor resets the chip when
+// it stops for CONFIG_AQ_LOGGER_WORKER_WDT_TIMEOUT_S. begin() seeds it before
+// the worker starts, so a worker that never stamps still ages out.
 std::atomic<std::int64_t> worker_heartbeat_us{0};
+#if CONFIG_AQ_LOGGER_WORKER_WDT
+// Survives the task-watchdog panic reset, lost on power-on.
+RTC_NOINIT_ATTR watchdog::Guard stall_guard;
+std::atomic<esp_task_wdt_user_handle_t> worker_wdt{nullptr};
+#endif
+// The single heartbeat stamp. It also feeds the worker's task-watchdog user.
+void stamp_heartbeat() {
+  worker_heartbeat_us = esp_timer_get_time();
+#if CONFIG_AQ_LOGGER_WORKER_WDT
+  if (auto *user = worker_wdt.load())
+    esp_task_wdt_reset_user(user);
+#endif
+}
 TaskHandle_t worker_task = nullptr;
 char boot_text[33]{};
 char device_text[13]{};
@@ -200,6 +221,9 @@ public:
   ~BusLock() { unlock_bus(); }
 };
 
+// Writer output. Each block that reaches the file is confirmed progress, so it
+// stamps the heartbeat after the write and never before. A write that never
+// returns still trips the watchdog, a slow one that keeps moving does not.
 bool sink(void *context, const std::uint8_t *data, std::size_t size) {
   BusLock lock;
   FILE *file = static_cast<FILE *>(context);
@@ -214,6 +238,7 @@ bool sink(void *context, const std::uint8_t *data, std::size_t size) {
       return false;
     }
     written += count;
+    stamp_heartbeat();
   }
   return true;
 }
@@ -265,6 +290,7 @@ bool check_file(const char *path, FILE *file, aqsync::FileCheck &check,
       return false;
     crc = crc32_update(crc, writer_state->crc_scratch, count);
     read_bytes += count;
+    stamp_heartbeat(); // a 1 MiB CRC pass is progress, not a stall
   }
   if (read_bytes != check.size)
     return false;
@@ -414,6 +440,7 @@ struct ArchiveDirectoryIO {
     return ::opendir(path);
   }
   static const struct dirent *read(DIR *directory) {
+    stamp_heartbeat(); // archive walks are progress, not a stall
     BusLock lock;
     errno = 0;
     return ::readdir(directory);
@@ -638,6 +665,8 @@ bool sync_file(OutputFile &target) {
   }
   target.sync_us += esp_timer_get_time() - started;
   sync_us = static_cast<std::uint32_t>(esp_timer_get_time() - started);
+  if (ok)
+    stamp_heartbeat(); // a completed fsync is progress
   return ok;
 }
 
@@ -653,6 +682,8 @@ bool append_group(OutputFile &target, std::size_t count) {
     close_failed(target, "row-group", result.error);
     return false;
   }
+  // Encoding after the last sink write is progress too.
+  stamp_heartbeat();
   if (!sync_file(target)) {
     close_failed(target, "row-group-sync", nullptr);
     return false;
@@ -836,7 +867,9 @@ bool commit(std::size_t &count, bool finalize) {
 // A one-row-group diagnostic copy of the RAM batch outside station trees;
 // the rows stay buffered for normal telemetry rotation.
 bool write_benchmark(std::size_t count, Codec codec) {
-  OutputFile &target = writer_state->benchmark;
+  if (!writer_state->benchmark)
+    return false;
+  OutputFile &target = *writer_state->benchmark;
   if (!count || target.open())
     return false;
   return create_file(target, codec, true) && append_group(target, count) &&
@@ -905,6 +938,7 @@ void quarantine_directory(const char *relative, unsigned depth,
   if (!directory)
     return;
   for (;;) {
+    stamp_heartbeat();
     const struct dirent *entry;
     {
       BusLock lock;
@@ -1114,6 +1148,9 @@ void send_file(const char *name) {
     aqlog.printf("PARQUET DATA offset=%lu hex=%s\n",
                  static_cast<unsigned long>(offset), hex);
     offset += count;
+    // A 1 MiB file is about 3 minutes of hex at 115200 baud, longer than the
+    // stall timeout. Each sent block is progress, not a stall.
+    stamp_heartbeat();
     vTaskDelay(pdMS_TO_TICKS(1) > 0 ? pdMS_TO_TICKS(1) : 1);
   }
   {
@@ -1346,7 +1383,7 @@ void service_samples_while_waiting();
 // data frame stops waiting once an ABORT arrived; a terminal ERROR does not,
 // and the slow peer rule bounds that wait.
 bool error_wait_step(void *) {
-  worker_heartbeat_us = esp_timer_get_time();
+  stamp_heartbeat();
   service_samples_while_waiting();
   return true;
 }
@@ -1368,7 +1405,7 @@ bool lan_error(ble::Op op, ble::Error code, const char *detail,
 bool respond(const std::uint8_t *frame, std::size_t length) {
   // A long LIST or READ is progress, not a stall: stamp the heartbeat per
   // frame so the stall detector only fires when sending truly stops.
-  worker_heartbeat_us = esp_timer_get_time();
+  stamp_heartbeat();
   return current_request && current_request->link == ble::Link::Lan
              ? lan_deliver(frame, length, current_request->peer,
                            current_request->link_generation)
@@ -1433,7 +1470,7 @@ aqsync::ArchiveSession archive_session(
                   : ble::deliver_error(op, code, detail, generation,
                                        error_wait_step, nullptr);
      },
-     [](void *) { worker_heartbeat_us = esp_timer_get_time(); }});
+     [](void *) { stamp_heartbeat(); }});
 
 const aqsync::ControlReplies control_replies{
     nullptr, [](void *, ble::Link) { return link_payload_max(); },
@@ -1447,11 +1484,19 @@ const aqsync::ControlReplies control_replies{
 std::int64_t uptime_seconds() { return esp_timer_get_time() / 1000000; }
 
 // Fresh free-space reading. False when the volume cannot answer.
+// A first free-cluster count can scan the whole FAT, so it is stamped on both
+// sides and bounded only by the watchdog timeout.
 bool measure_free(std::uint64_t &free_bytes) {
   if (!hooks.storage_free_bytes)
     return false;
-  BusLock lock;
-  return hooks.storage_free_bytes(free_bytes, hooks.context);
+  stamp_heartbeat();
+  bool ok;
+  {
+    BusLock lock;
+    ok = hooks.storage_free_bytes(free_bytes, hooks.context);
+  }
+  stamp_heartbeat();
+  return ok;
 }
 
 // Capacity and allocation unit right after a mount. Configures the governor
@@ -1459,6 +1504,7 @@ bool measure_free(std::uint64_t &free_bytes) {
 bool measure_volume() {
   std::uint64_t total = 0, used = 0;
   std::uint32_t cluster = 0;
+  stamp_heartbeat();
   {
     BusLock lock;
     total = hooks.storage_total_bytes ? hooks.storage_total_bytes(hooks.context)
@@ -1469,6 +1515,7 @@ bool measure_volume() {
                   ? hooks.storage_cluster_bytes(hooks.context)
                   : 0;
   }
+  stamp_heartbeat();
   total_kib = static_cast<std::uint32_t>(total / 1024);
   used_kib = static_cast<std::uint32_t>(used / 1024);
   std::uint64_t free_bytes = 0;
@@ -1532,10 +1579,43 @@ bool governed_commit(std::size_t &count, bool finalize) {
   return ok;
 }
 
+// The codec-test file and its stdio staging are borrowed from PSRAM only for
+// that command, so the resident workspace carries no benchmark OutputFile.
+bool alloc_benchmark() {
+  constexpr auto caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+  void *file = heap_caps_calloc(1, sizeof(OutputFile), caps);
+  auto *staging = static_cast<char *>(heap_caps_malloc(kStagingBytes, caps));
+  if (!file || !staging) {
+    heap_caps_free(file);
+    heap_caps_free(staging);
+    return false;
+  }
+  writer_state->benchmark = new (file) OutputFile{};
+  writer_state->benchmark->staging = staging;
+  return true;
+}
+
+void free_benchmark() {
+  OutputFile *target = writer_state->benchmark;
+  if (!target)
+    return;
+  writer_state->benchmark = nullptr;
+  // Normally already closed by finalize_file or close_failed. A leftover
+  // handle is closed under the bus lock like every other SD call.
+  if (target->file) {
+    BusLock lock;
+    std::fclose(target->file);
+  }
+  heap_caps_free(target->staging);
+  target->~OutputFile();
+  heap_caps_free(target);
+}
+
 // No file may be open across a remount. probe_storage releases the archive
 // session's read streams; their handles reopen by path on the next READ.
 bool files_closed() {
-  return !writer_state->telemetry.open() && !writer_state->benchmark.open();
+  return !writer_state->telemetry.open() &&
+         (!writer_state->benchmark || !writer_state->benchmark->open());
 }
 
 // Remount (when the board allows it) and re-measure. Clears Retry only when
@@ -1553,9 +1633,13 @@ void probe_storage(std::size_t &count, bool &storage_ready) {
     // A remount may follow an external card edit, so cached CRCs go too.
     archive_session.release_files();
     writer_state->crc_cache.clear();
-    BusLock lock;
-    ok = hooks.storage_remount(hooks.context) &&
-         aq::logger::detail::ensure_directory(kDirectory);
+    stamp_heartbeat();
+    {
+      BusLock lock;
+      ok = hooks.storage_remount(hooks.context) &&
+           aq::logger::detail::ensure_directory(kDirectory);
+    }
+    stamp_heartbeat();
     mounted_again = ok;
   }
   std::uint64_t free_bytes = 0;
@@ -1765,6 +1849,8 @@ void handle_control_request(const ble::ControlRequest &request,
 }
 
 void storage_worker(void *) {
+  // Startup scans below are covered from the first instruction.
+  stamp_heartbeat();
   bool storage_ready;
   {
     BusLock lock;
@@ -1794,7 +1880,7 @@ void storage_worker(void *) {
   Sample row;
   Command command;
   for (;;) {
-    worker_heartbeat_us = esp_timer_get_time();
+    stamp_heartbeat();
     // Sample priority is retained without sleeping before every control
     // request. Successful producers signal after copying to a queue.
     if (xQueueReceive(samples, &row, 0) == pdTRUE) {
@@ -1864,23 +1950,26 @@ void storage_worker(void *) {
         BusLock lock;
         bool closed = true;
         for (auto *target :
-             {&writer_state->telemetry, &writer_state->benchmark}) {
-          if (target->file) {
+             {&writer_state->telemetry, writer_state->benchmark}) {
+          if (target && target->file) {
             closed &= std::fclose(target->file) == 0;
             target->file = nullptr;
           }
         }
         // Only the configured archive roots. The benchmark root is not
-        // archive data and stays untouched.
+        // archive data and stays untouched. Every visited entry stamps the
+        // heartbeat, so a large archive is not mistaken for a stall.
+        aq::logger::detail::ArchiveResetIo io;
+        io.progress = stamp_heartbeat;
         erased =
             closed &&
             aq::logger::detail::erase_archive(
                 kDirectory, kDirectory, config.legacy_directory, files_removed,
-                directories_removed) &&
+                directories_removed, io) &&
             (!config.legacy_directory ||
              aq::logger::detail::erase_archive(
                  config.legacy_directory, kDirectory, config.legacy_directory,
-                 files_removed, directories_removed));
+                 files_removed, directories_removed, io));
       }
       count = 0;
       buffered = open_rows = open_groups = 0;
@@ -1901,7 +1990,7 @@ void storage_worker(void *) {
                           static_cast<unsigned long>(directories_removed));
       publish_status();
       for (;;) {
-        worker_heartbeat_us = esp_timer_get_time();
+        stamp_heartbeat();
         vTaskDelay(pdMS_TO_TICKS(1000));
       }
     } else if (std::strcmp(command.text, "parquet owner-pin") == 0) {
@@ -1973,18 +2062,16 @@ void storage_worker(void *) {
           governor.state() != storage::State::Ready) {
         aqlog.printf("PARQUET ERROR operation=codec-test reason=%s\n",
                      count ? storage::state_name(governor.state()) : "empty");
-      } else if (!(writer_state->benchmark.staging = static_cast<char *>(
-                       heap_caps_malloc(kStagingBytes, MALLOC_CAP_SPIRAM |
-                                                           MALLOC_CAP_8BIT)))) {
-        // Benchmark staging is borrowed from PSRAM only for this command.
+      } else if (!alloc_benchmark()) {
         ++errors;
-        aqlog.println("PARQUET ERROR operation=codec-test reason=no-psram");
+        aqlog.printf("PARQUET ERROR operation=allocate mem=psram bytes=%u "
+                     "purpose=codec-test\n",
+                     unsigned(sizeof(OutputFile) + kStagingBytes));
       } else {
         const auto previous = governor.state();
         const bool ok = write_benchmark(count, Codec::Uncompressed) &&
                         write_benchmark(count, Codec::Lz4Raw);
-        heap_caps_free(writer_state->benchmark.staging);
-        writer_state->benchmark.staging = nullptr;
+        free_benchmark();
         // A failed diagnostic copy does not pause telemetry; the next
         // telemetry write is the card test.
         std::uint64_t free_bytes = 0;
@@ -2213,6 +2300,136 @@ bool path_within(const char *path, const char *root) {
          (path[length] == '\0' || path[length] == '/');
 }
 
+#if CONFIG_AQ_LOGGER_WORKER_WDT
+// Watchdog state shared by begin(), poll() and the supervisor timer. The
+// supervisor state belongs to start_worker_watchdog() until the timer starts
+// and to the timer after that.
+std::atomic<bool> wdt_armed{false};
+std::atomic<bool> wdt_cleared{false};
+std::atomic<bool> wdt_recovered{false};
+// The guard's count as the supervisor last left it. The guard itself belongs
+// to the supervisor timer, so poll() reads this copy instead.
+std::atomic<std::uint32_t> wdt_consecutive{0};
+watchdog::Supervisor wdt_supervisor;
+
+// The task watchdog has one global config shared with the idle tasks and any
+// other user. A trip switches only its panic flag, and a recovery puts back
+// the config the IDF started with.
+esp_task_wdt_config_t task_wdt_config(bool panic) {
+  std::uint32_t idle_core_mask = 0;
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+  idle_core_mask |= 1U;
+#endif
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+  idle_core_mask |= 2U;
+#endif
+  return {CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000U, idle_core_mask, panic};
+}
+#ifdef CONFIG_ESP_TASK_WDT_PANIC
+constexpr bool kTaskWdtPanic = true;
+#else
+constexpr bool kTaskWdtPanic = false;
+#endif
+
+// The worker's task watchdog user, as watchdog::apply() and the start steps
+// in aq_logger_watchdog_apply.h use it.
+struct IdfTaskWdt {
+  bool add_user() {
+    esp_task_wdt_user_handle_t user = nullptr;
+    if (esp_task_wdt_add_user("parquet-sd", &user) != ESP_OK)
+      return false;
+    worker_wdt = user;
+    return true;
+  }
+  bool reset_user() {
+    return esp_task_wdt_reset_user(worker_wdt.load()) == ESP_OK;
+  }
+  bool reconfigure(bool panic) {
+    const auto config = task_wdt_config(panic);
+    return esp_task_wdt_reconfigure(&config) == ESP_OK;
+  }
+  // Unregisters the user so nothing is left armed without a feeder. A worker
+  // stamp racing this sees a cleared handle or one the IDF no longer lists.
+  void delete_user() {
+    if (auto *user = worker_wdt.exchange(nullptr))
+      esp_task_wdt_delete_user(user);
+  }
+};
+
+void supervise_worker(void *);
+
+struct IdfSupervisorTimer {
+  esp_timer_handle_t handle = nullptr;
+  bool create() {
+    static const esp_timer_create_args_t args{supervise_worker, nullptr,
+                                              ESP_TIMER_TASK, "aq-wdt", true};
+    return esp_timer_create(&args, &handle) == ESP_OK;
+  }
+  bool start() {
+    return esp_timer_start_periodic(handle, 1000000ULL) == ESP_OK;
+  }
+  void destroy() {
+    esp_timer_delete(handle);
+    handle = nullptr;
+  }
+};
+
+// Runs every second in the esp_timer task. The task watchdog has one global
+// period (CONFIG_ESP_TASK_WDT_TIMEOUT_S) shared with the idle tasks, so this
+// feeds the worker's user on its behalf while the heartbeat is younger than
+// the logger timeout. Long single SD calls between stamps are therefore safe.
+// Once the heartbeat expires it stops feeding, records the pending stall in
+// RTC memory and switches the task watchdog to panic, so the next period
+// names "parquet-sd" and resets with a core dump. A worker that moves again
+// first is recovered. The pending stall is withdrawn and the original config
+// comes back, so a later stall trips again. watchdog::supervise() decides and
+// watchdog::tick() applies it.
+void supervise_worker(void *) {
+  IdfTaskWdt twdt;
+  const auto result = watchdog::tick(
+      wdt_supervisor, stall_guard, twdt, esp_timer_get_time(),
+      worker_heartbeat_us.load(), CONFIG_AQ_LOGGER_WORKER_WDT_TIMEOUT_S,
+      CONFIG_AQ_LOGGER_WORKER_WDT_HEALTHY_S, kTaskWdtPanic);
+  wdt_consecutive = stall_guard.consecutive;
+  if (result.cleared)
+    wdt_cleared = true;
+  if (result.recovered)
+    wdt_recovered = true;
+  wdt_armed = wdt_supervisor.armed;
+}
+
+const char *watchdog_mode_name() { return wdt_armed.load() ? "armed" : "warn"; }
+
+void start_worker_watchdog() {
+  IdfTaskWdt twdt;
+  IdfSupervisorTimer timer;
+  auto boot = watchdog::prepare(wdt_supervisor, stall_guard, twdt, timer,
+                                esp_reset_reason() == ESP_RST_TASK_WDT,
+                                esp_timer_get_time());
+  // Published before the timer runs. After launch() the guard belongs to it.
+  const std::uint32_t consecutive = stall_guard.consecutive;
+  wdt_consecutive = consecutive;
+  wdt_armed = boot.armed;
+  if (boot.stall_reset)
+    aqlog.printf("PARQUET ERROR operation=worker-watchdog-reset "
+                 "consecutive=%lu\n",
+                 static_cast<unsigned long>(consecutive));
+  watchdog::launch(boot, wdt_supervisor, twdt, timer);
+  if (!boot.supervised)
+    wdt_armed = false;
+  aqlog.printf("PARQUET WATCHDOG mode=%s timeout_s=%u consecutive=%lu "
+               "max_consecutive=%lu healthy_s=%u supervised=%u\n",
+               boot.armed ? "armed" : "warn",
+               unsigned(CONFIG_AQ_LOGGER_WORKER_WDT_TIMEOUT_S),
+               static_cast<unsigned long>(consecutive),
+               static_cast<unsigned long>(watchdog::kMaxConsecutive),
+               unsigned(CONFIG_AQ_LOGGER_WORKER_WDT_HEALTHY_S),
+               boot.supervised ? 1U : 0U);
+}
+#else
+const char *watchdog_mode_name() { return "off"; }
+#endif
+
 bool begin(const Config &configuration, const Hooks &board_hooks,
            bool sd_mounted) {
   if (writer_state || accepting || !configuration.fields ||
@@ -2297,7 +2514,12 @@ bool begin(const Config &configuration, const Hooks &board_hooks,
   writer_state = static_cast<WriterState *>(heap_caps_calloc(
       1, sizeof(WriterState), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!spi_mutex || !samples || !commands || !worker_wakeup || !writer_state) {
-    aqlog.println("PARQUET ERROR operation=allocate logging=false");
+    if (!writer_state)
+      aqlog.printf("PARQUET ERROR operation=allocate mem=psram bytes=%u "
+                   "purpose=writer-state logging=false\n",
+                   unsigned(sizeof(WriterState)));
+    else
+      aqlog.println("PARQUET ERROR operation=allocate logging=false");
     return false;
   }
   new (writer_state) WriterState{};
@@ -2307,12 +2529,20 @@ bool begin(const Config &configuration, const Hooks &board_hooks,
   // when the RTC holds an earlier host sync.
   seed_clock_from_rtc();
   next_sample_us = esp_timer_get_time() + kSampleUs;
+  // Seed the heartbeat so a worker that blocks before its first stamp ages
+  // out like any other stall, for the worker-stall warning and the watchdog.
+  worker_heartbeat_us = esp_timer_get_time();
   if (xTaskCreate(storage_worker, "parquet-sd",
                   static_cast<std::uint32_t>(config.worker_stack_bytes),
                   nullptr, config.worker_priority, &worker_task) != pdPASS) {
     aqlog.println("PARQUET ERROR operation=task logging=false");
     return false;
   }
+#if CONFIG_AQ_LOGGER_WORKER_WDT
+  start_worker_watchdog();
+#else
+  aqlog.println("PARQUET WATCHDOG mode=off");
+#endif
   accepting = true;
   // The CRC-32 check value through the ROM routine OPEN uses on the device.
   const auto *check_bytes = reinterpret_cast<const std::uint8_t *>("123456789");
@@ -2349,9 +2579,9 @@ void poll() {
   {
     static std::int64_t last_stall_warning_us = 0;
     const auto heartbeat = worker_heartbeat_us.load();
-    if (heartbeat && now - heartbeat > 5000000LL &&
-        now - last_stall_warning_us > 30000000LL) {
-      last_stall_warning_us = now;
+    // Warn only. The reset decision belongs to the watchdog supervisor.
+    if (work::check_stall(now, heartbeat, last_stall_warning_us, 0) ==
+        work::StallAction::Warn) {
       const char *state_name = "?";
       if (worker_task) {
         switch (eTaskGetState(worker_task)) {
@@ -2374,14 +2604,24 @@ void poll() {
           break;
         }
       }
-      aqlog.printf(
-          "PARQUET ERROR operation=worker-stall seconds=%lld "
-          "state=%s stack_free=%u\n",
-          static_cast<long long>((now - heartbeat) / 1000000), state_name,
-          worker_task ? unsigned(uxTaskGetStackHighWaterMark(worker_task))
-                      : 0U);
+      const auto elapsed_s =
+          static_cast<long long>((now - heartbeat) / 1000000);
+      const unsigned stack_free =
+          worker_task ? unsigned(uxTaskGetStackHighWaterMark(worker_task)) : 0U;
+      aqlog.printf("PARQUET ERROR operation=worker-stall seconds=%lld "
+                   "state=%s stack_free=%u watchdog=%s\n",
+                   elapsed_s, state_name, stack_free, watchdog_mode_name());
     }
   }
+#if CONFIG_AQ_LOGGER_WORKER_WDT
+  if (wdt_recovered.exchange(false))
+    aqlog.printf("PARQUET WATCHDOG mode=%s consecutive=%lu reason=recovered\n",
+                 watchdog_mode_name(),
+                 static_cast<unsigned long>(wdt_consecutive.load()));
+  if (wdt_cleared.exchange(false))
+    aqlog.printf("PARQUET WATCHDOG mode=%s consecutive=0 reason=healthy\n",
+                 watchdog_mode_name());
+#endif
   report_runtime(now);
   if (now >= next_sample_us) {
     const auto skipped = (now - next_sample_us) / kSampleUs;

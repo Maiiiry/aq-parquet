@@ -8,6 +8,37 @@ lives in [ble-sync-protocol.md](ble-sync-protocol.md). Files already on a phone
 or SD card are never rewritten by the firmware, so the app must keep reading
 the older shapes it has stored, or the owner clears them.
 
+## Smaller resident writer workspace (feat/multi-chip-portability-and-watchdog)
+
+- `PARQUET BEGIN psram_workspace_bytes=` drops by about 51 KB because the
+  codec-test benchmark file is no longer resident. Waveshare V2 at schema v4
+  measured 162520 bytes on 2026-10-16. Value change only.
+- LOG_TAIL `PARQUET ERROR operation=codec-test reason=no-psram` is replaced by
+  `PARQUET ERROR operation=allocate mem=psram bytes=N purpose=codec-test`.
+- A failed workspace allocation at boot now logs
+  `PARQUET ERROR operation=allocate mem=psram bytes=N purpose=writer-state
+  logging=false`. Other boot allocation failures keep the old line.
+- The app does not parse these lines, so no app change is required.
+
+## Storage worker watchdog (feat/multi-chip-portability-and-watchdog)
+
+- LOG_TAIL `PARQUET ERROR operation=worker-stall` gains a trailing
+  `watchdog=armed|warn|off` field. Additive.
+- New LOG_TAIL lines `PARQUET WATCHDOG mode=... timeout_s=... consecutive=...`
+  at boot and `PARQUET ERROR operation=worker-watchdog-reset consecutive=N`
+  after a stall reset. Additive.
+- A stalled storage worker now resets the device after about 60 s instead of
+  staying wedged. The app sees a normal BLE/LAN disconnect and reconnect.
+- New LOG_TAIL line `PARQUET WATCHDOG mode=armed consecutive=N
+  reason=recovered` when a stalled worker moves again before the reset. The
+  device keeps running and a later stall can trip again. Additive.
+- `PARQUET WATCHDOG ... supervised=0` now comes with `mode=warn`, since a
+  worker without its supervisor timer is never left armed.
+- A serial `parquet get` and its CRC pass count as worker progress, so a
+  large USB export no longer logs `worker-stall` or trips the watchdog.
+- No STATUS, LIVE, GET_DIAG, GET_CONFIG or advertising field changes. The app
+  does not parse these log lines today, so no app change is required.
+
 ## CoreS3 acquisition configuration v3 (refactor/board-neutral-logger-and-sensors)
 
 - The CoreS3 file metadata `configuration_id` changes from
