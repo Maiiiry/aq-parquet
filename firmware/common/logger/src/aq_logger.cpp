@@ -4,6 +4,7 @@
 #include "aq_logger_directory.h"
 #include "aq_logger_emergency_close.h"
 #include "aq_logger_list_job.h"
+#include "aq_logger_list_since.h"
 #include "aq_logger_live.h"
 #include "aq_logger_location.h"
 #include "aq_logger_power.h"
@@ -182,6 +183,14 @@ std::uint32_t quarantine_counter = 0; // unique per boot
 // periodic run).
 // docs/shared/ble-sync-protocol.md.
 std::atomic<bool> unlisted_files{false};
+// LIST_SINCE state (aq_logger_list_since.h). Storage worker only, except
+// mount_epoch, which STATUS reads. The FAT volume serial of this mount, 0
+// when unknown.
+namespace list_since = aq::logger::list_since;
+std::atomic<std::uint32_t> mount_epoch{0};
+list_since::RingKeeper boot_ring;
+// The lowest dated day and the last unsynced sequence of this boot.
+list_since::Tracker since_state;
 std::int64_t boot_hi = 0, boot_lo = 0, device = 0, next_sample_us = 0;
 std::int64_t sample_sequence = 0;
 std::atomic<std::int64_t> missed_deadlines{0};
@@ -572,6 +581,82 @@ void close_failed(OutputFile &target, const char *operation,
   }
 }
 
+// The boot ring is one blob, `boots`, in the `parquet` namespace next to
+// `station` and `codec`. Never erased.
+constexpr char kRingKey[] = "boots";
+const list_since::RingStore ring_store{
+    nullptr,
+    [](void *, std::span<std::uint8_t, list_since::kRingBlobBytes> blob,
+       std::size_t &length) {
+      nvs_handle_t settings;
+      const esp_err_t opened = nvs_open("parquet", NVS_READONLY, &settings);
+      if (opened == ESP_ERR_NVS_NOT_FOUND)
+        return list_since::Load::Missing;
+      if (opened != ESP_OK)
+        return list_since::Load::Failed;
+      length = blob.size();
+      const esp_err_t read =
+          nvs_get_blob(settings, kRingKey, blob.data(), &length);
+      nvs_close(settings);
+      if (read == ESP_ERR_NVS_NOT_FOUND)
+        return list_since::Load::Missing;
+      return read == ESP_OK ? list_since::Load::Found
+                            : list_since::Load::Failed;
+    },
+    [](void *, std::span<const std::uint8_t, list_since::kRingBlobBytes> blob) {
+      nvs_handle_t settings;
+      if (nvs_open("parquet", NVS_READWRITE, &settings) != ESP_OK)
+        return false;
+      const bool ok = nvs_set_blob(settings, kRingKey, blob.data(),
+                                   blob.size()) == ESP_OK &&
+                      nvs_commit(settings) == ESP_OK;
+      nvs_close(settings);
+      return ok;
+    }};
+
+// Names this boot in the ring before its first unsynced folder exists. A
+// failure only widens the next LIST_SINCE, so the file is still written.
+void note_unsynced_boot() {
+  if (boot_ring.appended())
+    return;
+  boot_ring.note_unsynced(ring_store);
+  char marker[192] = {};
+  const bool named =
+      list_since::marker_path(marker, kDirectory, station_text, boot_text);
+  if (boot_ring.appended()) {
+    const auto *ring = boot_ring.ring(ring_store);
+    aqlog.printf("PARQUET BOOT_RING appended=%lu\n",
+                 static_cast<unsigned long>(ring ? ring->appended() : 0));
+    if (!boot_ring.stale_marker())
+      return;
+    // The ring names this boot now, so its marker would only make walks
+    // read the folder again once the boot ages out of the ring.
+    int failure = 0;
+    if (named) {
+      BusLock lock;
+      if (::rmdir(marker) != 0)
+        failure = errno;
+    } else {
+      failure = ENAMETOOLONG;
+    }
+    if (failure)
+      aqlog.printf("PARQUET WARN operation=boot-ring-marker-remove errno=%d\n",
+                   failure);
+    else
+      boot_ring.marker_removed();
+    return;
+  }
+  aqlog.println("PARQUET WARN operation=boot-ring list_since=unsynced-full");
+  if (!boot_ring.needs_marker())
+    return;
+  // A later boot's ring will not name this boot, so its LIST_SINCE finds
+  // the boot folder through this marker.
+  if (named && make_directories(marker))
+    boot_ring.marker_made();
+  else
+    aqlog.println("PARQUET ERROR operation=boot-ring-marker");
+}
+
 // Creates `<partition>/<prefix>_<boot>_<first>-<attempt>.partial` from the
 // first buffered row and starts the writer.
 bool create_file(OutputFile &target, Codec codec, bool benchmark) {
@@ -602,11 +687,15 @@ bool create_file(OutputFile &target, Codec codec, bool benchmark) {
     std::snprintf(prefix, sizeof(prefix), "data_%02d%02d", utc.tm_hour,
                   utc.tm_min);
     target.dated = true;
+    since_state.dated(static_cast<unsigned>(utc.tm_year + 1900),
+                      static_cast<unsigned>(utc.tm_mon + 1),
+                      static_cast<unsigned>(utc.tm_mday));
   } else {
     partition_length =
         std::snprintf(partition, sizeof(partition),
                       "station=%s/unsynced/boot=%s", station_text, boot_text);
     std::strcpy(prefix, "data_unsynced");
+    note_unsynced_boot();
   }
   char directory[192];
   const int directory_length = std::snprintf(directory, sizeof(directory),
@@ -833,6 +922,7 @@ bool finalize_file(OutputFile &target) {
   }
   ++finalized;
   unlisted_files = true;
+  since_state.finalized(target.benchmark, target.dated, target.last);
   if (!target.benchmark)
     remember_crc(ready, size, crc);
   aqlog.printf(
@@ -908,50 +998,87 @@ bool emit_file_serial(void *, const char *name, std::uint32_t bytes) {
   return true;
 }
 
+// The UTC day before today, 0 without UTC.
+std::uint32_t utc_yesterday() {
+  std::int32_t generation;
+  std::int64_t now, mono_anchor, utc_anchor;
+  portENTER_CRITICAL(&clock_mutex);
+  now = esp_timer_get_time();
+  generation = clock_generation;
+  mono_anchor = anchor_mono_us;
+  utc_anchor = anchor_utc_ns;
+  portEXIT_CRITICAL(&clock_mutex);
+  if (!generation)
+    return 0;
+  return list_since::day_before(
+      aq::utc::estimate_ns(now, mono_anchor, utc_anchor) / 1000000);
+}
+
+// Emits each finalized file as `<prefix><name>` and counts the .partial
+// files. Sets bad_entry for a file the wire cannot describe. Shared by the
+// plain LIST walk and the LIST_SINCE walk.
+struct ListVisitor {
+  const char *prefix = "";
+  FileEmitter emit = nullptr;
+  void *context = nullptr;
+  unsigned *partials = nullptr;
+  // Set for a file the wire cannot describe.
+  bool bad_entry = false;
+
+  bool operator()(const char *name, const struct stat &info) {
+    if (S_ISREG(info.st_mode) && safe_name(name)) {
+      if (info.st_size < 0 ||
+          static_cast<std::uint64_t>(info.st_size) > UINT32_MAX) {
+        errno = EOVERFLOW;
+        bad_entry = true;
+        return false;
+      }
+      char exported[400];
+      const int length =
+          std::snprintf(exported, sizeof(exported), "%s%s", prefix, name);
+      if (length < 0 || static_cast<std::size_t>(length) >= sizeof(exported)) {
+        errno = ENAMETOOLONG;
+        bad_entry = true;
+        return false;
+      }
+      return emit(context, exported, static_cast<std::uint32_t>(info.st_size));
+    }
+    if (std::strstr(name, ".partial") && *partials != UINT32_MAX)
+      ++*partials;
+    return true;
+  }
+};
+
 // Walks the main archive tree, then the legacy tree, in bounded steps. Only a
 // complete scan replaces the partial counter. Holds its directories open
-// between steps until it ends or cancel() runs.
+// between steps until it ends or cancel() runs. step_since() runs the
+// LIST_SINCE walk through the same IO, one walk at a time.
 class ArchiveList {
 public:
+  // `since` holds the LIST_SINCE walk, about 1 KiB, so the full walk of
+  // list_all() keeps it off the worker stack. Without it step_since fails.
+  explicit ArchiveList(
+      list_since::IncrementalWalk<ArchiveDirectoryIO> *since = nullptr)
+      : since_(since) {}
+
   aqsync::ListStatus step(bool start, unsigned budget, FileEmitter emit,
                           void *context, unsigned &partials) {
     if (start) {
       cancel();
+      incremental_ = false;
       finalized_at_start_ = finalized.load();
       if (!walk_.begin(io_, kDirectory))
         return fail();
     }
-    const char *prefix = legacy_ ? "legacy-parquet/" : "";
-    bool bad_entry = false;
-    auto visit = [&](const char *name, const struct stat &info) {
-      if (S_ISREG(info.st_mode) && safe_name(name)) {
-        if (info.st_size < 0 ||
-            static_cast<std::uint64_t>(info.st_size) > UINT32_MAX) {
-          errno = EOVERFLOW;
-          bad_entry = true;
-          return false;
-        }
-        char exported[400];
-        const int length =
-            std::snprintf(exported, sizeof(exported), "%s%s", prefix, name);
-        if (length < 0 ||
-            static_cast<std::size_t>(length) >= sizeof(exported)) {
-          errno = ENAMETOOLONG;
-          bad_entry = true;
-          return false;
-        }
-        return emit(context, exported,
-                    static_cast<std::uint32_t>(info.st_size));
-      }
-      if (std::strstr(name, ".partial") && partials != UINT32_MAX)
-        ++partials;
-      return true;
-    };
+    ListVisitor visit{.prefix = legacy_ ? "legacy-parquet/" : "",
+                      .emit = emit,
+                      .context = context,
+                      .partials = &partials};
     using Walk = aq::logger::detail::DirectoryWalk<ArchiveDirectoryIO>;
     const auto status = walk_.step(budget, visit);
     if (status == Walk::Status::More)
       return aqsync::ListStatus::More;
-    if (status == Walk::Status::Failed || bad_entry)
+    if (status == Walk::Status::Failed || visit.bad_entry)
       return fail();
     if (status == Walk::Status::Stopped) {
       cancel();
@@ -987,8 +1114,63 @@ public:
     return aqsync::ListStatus::Complete;
   }
 
+  // LIST_SINCE. The plan picks the plain walk when the cursor does not
+  // match this mount, or the incremental walk of this station.
+  aqsync::ListStatus step_since(bool start, const aqsync::ListCursor &cursor,
+                                aqsync::ListSinceResult &result,
+                                unsigned budget, FileEmitter emit,
+                                void *context, unsigned &partials) {
+    if (start) {
+      cancel();
+      if (!since_) {
+        errno = ENOTSUP;
+        return fail();
+      }
+      const auto in = since_state.inputs(
+          cursor, mount_epoch.load(), utc_yesterday(), boot_ring, ring_store);
+      const auto plan = list_since::plan(in);
+      result = plan.result;
+      aqlog.printf("LIST_SINCE plan full=%u floor=%lu unsynced_full=%u "
+                   "first_age=%u boots=%u next_day=%lu\n",
+                   plan.full ? 1U : 0U, static_cast<unsigned long>(plan.floor),
+                   plan.unsynced_full ? 1U : 0U, unsigned(plan.first_age),
+                   unsigned(in.ring ? in.ring->size() : 0),
+                   static_cast<unsigned long>(result.next.day));
+      if (plan.full)
+        return step(true, budget, emit, context, partials);
+      incremental_ = true;
+      finalized_at_start_ = finalized.load();
+      if (!since_->begin(io_, kDirectory, station_text, plan,
+                         in.ring ? *in.ring : list_since::Ring{}))
+        return fail();
+    }
+    if (!incremental_ || !since_)
+      return step(false, budget, emit, context, partials);
+    ListVisitor visit{
+        .prefix = "", .emit = emit, .context = context, .partials = &partials};
+    using Walk = list_since::IncrementalWalk<ArchiveDirectoryIO>;
+    const auto status = since_->step(budget, visit);
+    if (status == Walk::Status::More)
+      return aqsync::ListStatus::More;
+    if (status == Walk::Status::Failed || visit.bad_entry)
+      return fail();
+    if (status == Walk::Status::Stopped) {
+      cancel();
+      return aqsync::ListStatus::Stopped;
+    }
+    // Ringless markers past kMaxRingless made it walk the whole unsynced
+    // tree. Its partials count covers only the folders it read, so STATUS
+    // keeps the count of the last full walk.
+    if (since_->widened())
+      result.flags |= aqsync::kListSinceUnsyncedFull;
+    cancel();
+    return aqsync::ListStatus::Complete;
+  }
+
   void cancel() {
     walk_.cancel();
+    if (since_)
+      since_->cancel();
     legacy_ = false;
   }
 
@@ -1008,13 +1190,16 @@ private:
   }
 
   aq::logger::detail::DirectoryWalk<ArchiveDirectoryIO> walk_;
+  list_since::IncrementalWalk<ArchiveDirectoryIO> *since_;
   ArchiveDirectoryIO io_;
   std::uint32_t finalized_at_start_ = 0;
   bool legacy_ = false;
+  bool incremental_ = false;
 };
 
-// The radio LIST job's walk. Only the storage worker touches it.
-ArchiveList archive_list;
+// The radio LIST and LIST_SINCE walks. Only the storage worker touches them.
+list_since::IncrementalWalk<ArchiveDirectoryIO> archive_since;
+ArchiveList archive_list{&archive_since};
 
 bool partial_name(const char *name) {
   const std::size_t length = std::strlen(name);
@@ -1391,6 +1576,7 @@ std::size_t build_status_json(char *out, std::size_t size) {
   view.used_kib = used_kib.load();
   view.heap_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   view.partials = partials_seen.load();
+  view.mount_epoch = mount_epoch.load();
   view.quarantined = partials_quarantined.load();
   view.quarantine_bytes = quarantine_bytes.load();
   view.open_rows = open_rows.load();
@@ -1556,7 +1742,13 @@ aqsync::ArchiveSession archive_session(
      // A due critical battery close ends a LIST job before its next step or
      // FILE. CHUNK frames and ring waits stop through the transfer gate,
      // which reads the same close (aq_logger_transfer_gate.h).
-     [](void *) { return emergency_close.preempt(uptime_ms()); }},
+     [](void *) { return emergency_close.preempt(uptime_ms()); },
+     [](void *, bool start, const aqsync::ListCursor &cursor,
+        aqsync::ListSinceResult &result, unsigned budget,
+        aqsync::FileEmitter emit, void *context, unsigned &partials) {
+       return archive_list.step_since(start, cursor, result, budget, emit,
+                                      context, partials);
+     }},
     {nullptr,
      [](void *, ble::Link link, std::uint8_t peer) {
        return link_generation(link, peer);
@@ -1628,6 +1820,9 @@ bool measure_volume() {
     cluster = hooks.storage_cluster_bytes
                   ? hooks.storage_cluster_bytes(hooks.context)
                   : 0;
+    mount_epoch = hooks.storage_volume_serial
+                      ? hooks.storage_volume_serial(hooks.context)
+                      : 0;
   }
   stamp_heartbeat();
   total_kib = static_cast<std::uint32_t>(total / 1024);
@@ -1636,13 +1831,14 @@ bool measure_volume() {
   const bool ok = total != 0 && measure_free(free_bytes);
   aqlog.printf(
       "PARQUET STORAGE mount cluster_bytes=%lu total_kib=%llu "
-      "free_kib=%llu reserve_kib=%llu high_kib=%llu\n",
+      "free_kib=%llu reserve_kib=%llu high_kib=%llu mount_epoch=%08lx\n",
       static_cast<unsigned long>(cluster),
       static_cast<unsigned long long>(total / 1024),
       static_cast<unsigned long long>(free_bytes / 1024),
       static_cast<unsigned long long>(storage::thresholds(total).reserve /
                                       1024),
-      static_cast<unsigned long long>(storage::thresholds(total).high / 1024));
+      static_cast<unsigned long long>(storage::thresholds(total).high / 1024),
+      static_cast<unsigned long>(mount_epoch.load()));
   governor.configure(total);
   if (ok)
     governor.observe_free(free_bytes, uptime_seconds());
@@ -1758,6 +1954,8 @@ void probe_storage(std::size_t &count, bool &storage_ready,
     // A remount may follow an external card edit, so cached CRCs go too.
     archive_session.remounted();
     writer_state->crc_cache.clear();
+    // The card may be another one until the mount reads its serial.
+    mount_epoch = 0;
     stamp_heartbeat();
     {
       BusLock lock;
@@ -2776,6 +2974,11 @@ bool begin(const Config &configuration, const Hooks &board_hooks,
   std::snprintf(boot_text, sizeof(boot_text), "%016llx%016llx",
                 static_cast<unsigned long long>(boot_hi),
                 static_cast<unsigned long long>(boot_lo));
+  {
+    list_since::BootId boot{};
+    if (list_since::parse_boot(boot_text, boot))
+      boot_ring.set_current(boot);
+  }
   spi_mutex = xSemaphoreCreateMutex();
   sync_config = config.sync ? *config.sync : aqsync::ServiceConfig{};
   samples = xQueueCreate(sync_config.sample_queue_depth, sizeof(Sample));

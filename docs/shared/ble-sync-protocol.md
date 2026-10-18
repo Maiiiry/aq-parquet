@@ -168,6 +168,7 @@ Notified after every stored sample (every 10 s) and after any `control` request 
 | `sd` | 1 when the card is mounted and the output directory exists |
 | `part` | retained `.partial` files seen at the last listing |
 | `qf` / `qb` | retained quarantine file count / bytes after startup quarantine; includes earlier boots |
+| `ls` | `LIST_SINCE` mount epoch, the FAT volume serial of the mounted card as a u32, 0 while no card is mounted or the serial is unknown. A phone compares it with the `mount_epoch` of its saved cursor to know before listing whether the cursor still applies. Absent on older firmware |
 | `dc` / `dr` | proto 3. `dc` counts BLE and LAN sessions closed since boot, including refused LAN clients, saturating at 65535. `dr` is the newest [disconnect reason](#disconnect-reasons) code, or null while `dc` is 0 |
 
 A board without an enabled RTC adapter reports `rtc=2`. Each boot starts with
@@ -208,6 +209,10 @@ PM keys appear only when `pms == 4`. The snapshot is the same row that was queue
 
 First byte is the opcode. Unknown opcode → `ERROR` code 11.
 
+Opcodes and response frame types are separate number spaces. Opcode `0x10`
+is `LIST_SINCE` and frame type `0x10` is `FILE`, and a phone tells them apart
+by direction.
+
 | Op | Name | Request body | Response frames |
 | --- | --- | --- | --- |
 | `0x01` | `LIST` | — | `FILE` × n, then `LIST_END` on a complete scan, or `ERROR` |
@@ -225,6 +230,7 @@ First byte is the opcode. Unknown opcode → `ERROR` code 11.
 | `0x0D` | `GET_TOKEN` | — | `TOKEN`; **BLE only**, `ERROR` 13 over LAN |
 | `0x0E` | `GET_DIAG` | empty (any body is `ERROR` 1) | `DIAG`, or `ERROR` 7 `detail="mtu"` when `payload_max` is below 38 |
 | `0x0F` | `ABORT` | empty (any body is `ERROR` 1) | `ABORTED` with the op it stopped, `op=0` when idle |
+| `0x10` | `LIST_SINCE` | cursor, 32 bytes. See [LIST_SINCE](#list_since) | `FILE` × n, then `LIST_SINCE_END`, or `ERROR`. Older firmware answers `ERROR` 11 |
 
 | Frame | Type | Body |
 | --- | --- | --- |
@@ -249,10 +255,11 @@ First byte is the opcode. Unknown opcode → `ERROR` code 11.
 | `BYE` | `0x4B` | `reason` u8, `generation` u32, `err` i16, `queued` u16, `uptime_s` u32. 14 bytes with the type, 16 on the LAN wire. See [BYE](#bye) |
 | `DIAG` | `0x4C` | `boot_seq` u16, `counts` 17 × u16, `n` u8, then `n` × 16-byte events. 38 + 16n bytes. See [DIAG](#get_diag-and-diag) |
 | `ABORTED` | `0x4D` | `op` u8, the opcode that was stopped, 0 when nothing was running |
+| `LIST_SINCE_END` | `0x4E` | the 14 `LIST_END` body bytes, `flags` u8, then the next cursor (32 bytes). 48 bytes with the type. See [LIST_SINCE](#list_since) |
 | `CONFIG_CHUNK` | `0x4A` | BLE only: `flags` u8 (same as CONFIG), `total_json_bytes` u16 LE, `offset` u16 LE, then a raw UTF-8 JSON slice. The header is 6 bytes; slices are at most 128 bytes and frames never exceed negotiated `payload_max`. A UTF-8 character may cross frames, so assemble bytes before decoding JSON. Require contiguous offsets from zero until `offset + slice_bytes = total_json_bytes`, with identical flags and total length on each chunk. There is no terminal frame; abandon an incomplete answer and make a fresh GET_CONFIG request |
 | `ERROR` | `0x7F` | `op` u8, `code` u8, `detail` utf8 |
 
-The status JSON remains bounded to 480 bytes. The actual formatter retains every key at 476 bytes with the widest representable values, including `sd_state`, `dc=65535`, `dr=255` and `clk`/`rtc` at their u8 limit (471 for LZ4), checked by `pixi run logger-status-test`, which also requires 4 bytes of headroom. In addition to the existing counters, `part` is the number of retained `.partial` files found by the startup/list scan, while `qf` and `qb` are the total file count and total bytes currently under `/output/quarantine/` after startup quarantine completes. `qf` and `qb` include files preserved by earlier boots, not only files moved during the current boot; both saturate at their unsigned integer limits rather than wrapping.
+The status JSON remains bounded to 480 bytes. The actual formatter retains every key at 467 bytes with the widest representable values, including `sd_state`, `dc=65535`, `dr=255`, `clk`/`rtc` at their u8 limit, `ls` at its u32 limit, and the clamped `utc_ms`, `clk_age_s` and `miss` (462 for LZ4), checked by `pixi run logger-status-test`, which also requires 10 bytes of headroom. In addition to the existing counters, `part` is the number of retained `.partial` files found by the startup/list scan, while `qf` and `qb` are the total file count and total bytes currently under `/output/quarantine/` after startup quarantine completes. `qf` and `qb` include files preserved by earlier boots, not only files moved during the current boot; both saturate at their unsigned integer limits rather than wrapping.
 
 `ERROR.op` echoes the **first byte of the request** as received, even when that byte is not a known opcode (code 11); an empty write is reported as `op=0x01 code=1 detail="empty"`. `OPENED.name` is the requested name in full; the device does not shorten it (names are ≤ 399 bytes, so on an MTU-517 link every `OPENED` fits one PDU, another reason the phone must negotiate 517). A `FILE` entry whose name would not fit `payload_max − 5` aborts LIST with error 7 (`detail="mtu"`) and is logged on serial as `BLE LIST SKIP`. An archive exceeding the u32 count capacity aborts LIST with error 7 (`detail="count"`). Filesystem enumeration failures (including an SD read failure after earlier entries) abort LIST with error 8. Neither case produces `LIST_END`. Clients commit a replacement listing only after a valid `LIST_END`; preceding `FILE` entries alone are an incomplete snapshot. The device clears its `new_files` hint only after a complete scan and accepted `LIST_END` delivery. `READ_END.next_offset` always equals `offset + bytes actually delivered in CHUNK frames`; a phone that received fewer bytes has lost a notification and must treat the **window** as failed, never trust `next_offset` over its own count, and a failed window is retried with a new `READ` from the phone's own offset, not an aborted sync. Measured 2026-09-17: an Android phone's Bluetooth stack dropped runs of 16 to 18 consecutive notifications at the start of a window while the board's Wi-Fi was active (the same windows reached a Mac intact), so clients should keep reading until that request's `READ_END` before re-issuing, and are advised to use ≤ 4 KiB windows over BLE (16 KiB over LAN).
 
@@ -522,6 +529,122 @@ Golden `4d00` (idle) and `4d03` (a stopped `READ`).
 `count` widens to u32. Golden `117011010001000066ed0000040000` is 70000 files,
 1 partial, `sd_kib` 15558144, `sd_used_kib` 1024. A proto 3 phone must reject
 a 13-byte `LIST_END`.
+
+### LIST_SINCE
+
+`LIST_SINCE` (`0x10`) lists the files of this station that are new since a
+cursor the phone saved from an earlier `LIST_SINCE_END`. On a large archive it
+reads a few folders instead of the whole card. It runs over BLE and LAN with
+the same rules as `LIST` (one walk at a time, 32 directory entries per step,
+`ABORT`, preemption and remount). A board without it answers `ERROR` 11 with
+op `0x10`, and the phone falls back to `LIST`.
+
+The request is exactly 33 bytes, little-endian.
+
+| Offset | Field | Type |
+| --- | --- | --- |
+| 0 | op `0x10` | u8 |
+| 1 | `mount_epoch` | u32 |
+| 5 | `day` YYYYMMDD, 0 for no floor | u32 |
+| 9 | `boot` | 16 bytes |
+| 25 | `seq` | u64 |
+
+The answer is `FILE` frames, exactly as `LIST` sends them, then
+`LIST_SINCE_END` (`0x4E`), 48 bytes.
+
+| Offset | Field | Type |
+| --- | --- | --- |
+| 0 | type `0x4E` | u8 |
+| 1 | `count` | u32 |
+| 5 | `partials` | u16 |
+| 7 | `sd_kib` | u32 |
+| 11 | `sd_used_kib` | u32 |
+| 15 | `flags` | u8 |
+| 16 | next `mount_epoch` | u32 |
+| 20 | next `day` | u32 |
+| 24 | next `boot` | 16 bytes |
+| 40 | next `seq` | u64 |
+
+The first 15 bytes have the `LIST_END` layout. `flags` bit 0 `full` means the
+cursor did not match this mount and the board walked everything plain `LIST`
+walks. Bit 1 `unsynced_full` means the board walked the whole unsynced tree of
+this station because it could not place the cursor boot. Other bits are 0.
+
+Golden request
+`10d4c3b2a1db25350100112233445566778899aabbccddeeff0700000000000000` is epoch
+`0xa1b2c3d4`, day 20260315, boot `00112233445566778899aabbccddeeff`, seq 7.
+Golden end
+`4e020000000000e80300000a00000002d4c3b2a1dc25350100112233445566778899aabbccddeeff2a00000000000000`
+is 2 files, no partials, `sd_kib` 1000, `sd_used_kib` 10, `unsynced_full`,
+then the next cursor with day 20260316 and seq 42.
+
+**The cursor is opaque.** The phone stores the 32 cursor bytes as they came
+and sends them back unchanged. It never builds or edits one, except the
+all-zero cursor, which asks for a full listing and returns a first cursor.
+
+**What the board walks.**
+
+- The mount epoch is the FAT volume serial of the card. A cursor from another
+  card, a reformatted card or a board that cannot read the serial (epoch 0)
+  gets the `full` listing.
+- Dated files. The board walks `station=<id>/year=…/month=…/day=…` from a
+  floor day up, and skips older year, month and day folders without reading
+  them. The floor is the smallest of the cursor day, the UTC day before today
+  and the lowest day this boot wrote a dated file in. A cursor day of 0 sets
+  no floor. A floor before 2020 counts as no floor. A file the board writes
+  into an older day folder, after a clock that moved back, is still found
+  this way, as long as the board has not rebooted since.
+- Unsynced files. Each boot that writes into `station=<id>/unsynced/` first
+  appends its boot id to a ring of the last 16 such boots in NVS (namespace
+  `parquet`, key `boots`). The board walks the cursor boot folder, keeping
+  only names whose first sequence is at least the cursor `seq`, then every
+  newer boot in the ring. A seq of `UINT64_MAX` means that boot was fully
+  listed. A cursor boot the ring no longer holds, a ring that NVS cannot
+  read or write, or a boot whose append failed gives `unsynced_full`. A boot id
+  of all `0xff` in the next cursor means the board could not vouch for the
+  ring, so the next request walks the whole unsynced tree again. An NVS
+  failure never stops a file from being written.
+- Files of other stations, `legacy-parquet/` and `benchmarks/` appear only in a
+  `full` listing.
+
+**Errors**, all with op `0x10`.
+
+| Case | Answer |
+| --- | --- |
+| Length not 33, or a nonzero `day` that is not a valid YYYYMMDD | `ERROR` 1 `detail="cursor"` |
+| No card or output folder | `ERROR` 8 |
+| Another list running, a preempting close, a remount, more than u32 files, a name wider than `payload_max − 5` | `ERROR` 7 with `detail` `list`, `preempted`, `remount`, `count` or `mtu`, as for `LIST` |
+| `payload_max` below 48 | `ERROR` 7 `detail="mtu"` before any `FILE` |
+| `ABORT` | `ERROR` 16, then `ABORTED` naming `0x10` |
+| Firmware without the incremental walk | `ERROR` 11 |
+
+A walk that ends early sends no `LIST_SINCE_END`, and the phone keeps its
+previous cursor. The board clears the `new_files` hint after it delivered
+`LIST_SINCE_END`, as after `LIST_END`. `partials` counts only the `.partial`
+files in the folders walked, and the incremental walk does not update the
+STATUS `part` count, which follows the last full walk.
+
+**Known limits and the audit.** The lowest dated day this boot wrote is kept in
+RAM only, so the board writes nothing to NVS per listing. A clock moved back
+across a reboot can put a file in a day folder below the next floor. A boot
+whose ring append fails makes an empty marker folder
+`station=<id>/unsynced/ringless=<boot>` before its first unsynced file. Every
+incremental walk reads the entries of `unsynced/` once and lists each marked
+boot that is not in the ring in full, so a later boot still finds it. The
+phone drops the names it already holds. The logger removes the marker, best
+effort, when a later ring append in the same boot succeeds. Otherwise it stays
+until the serial archive reset, `parquet erase-archive CONFIRM`. More than 4
+such markers widen the
+walk to the whole unsynced tree and set `unsynced_full`. A boot that could not
+make its marker either, after both NVS and the card failed, can still be
+missed. The phone therefore runs a periodic audit, a plain `LIST` or a
+`LIST_SINCE` with the all-zero cursor, for example once a day or every tenth
+sync, and merges its result the same way.
+
+The STATUS JSON stays at most 480 bytes. Since `ls` was added, `utc_ms` is
+clamped to 13 digits and `clk_age_s` and `miss` to the u32 range, values a
+valid 2020 to 2100 clock never reaches. The widest STATUS is 467 bytes, as in
+[the response frames](#control-write-and-response-notify).
 
 ### Persistent log
 
