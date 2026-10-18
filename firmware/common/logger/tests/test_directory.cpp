@@ -1,5 +1,6 @@
 #include "aq_logger_directory.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <dirent.h>
@@ -440,6 +441,76 @@ void check_same_boot_quarantine() {
   fs::remove_all(temporary);
 }
 
+struct PosixDirectoryIO {
+  DIR *open(const char *path) { return ::opendir(path); }
+  const struct dirent *read(DIR *directory) { return ::readdir(directory); }
+  int inspect(const char *path, struct stat *info) {
+    return ::stat(path, info);
+  }
+  int close(DIR *directory) { return ::closedir(directory); }
+};
+
+// The startup quarantine walk is iterative. It finds partials down to the
+// depth cap while they are moved out under it, never enters quarantine/,
+// and reports a deeper directory instead of skipping it silently.
+void check_find_partials() {
+  namespace fs = std::filesystem;
+  using aq::logger::detail::DirectoryWalk;
+  using aq::logger::detail::find_partials;
+  char temporary[] = "/tmp/aq-find-partials-XXXXXX";
+  assert(::mkdtemp(temporary));
+  const fs::path root = fs::path(temporary) / "output";
+  const auto touch = [](const fs::path &path) {
+    fs::create_directories(path.parent_path());
+    std::ofstream(path) << "x";
+  };
+  touch(root / "top-0.partial");
+  touch(root / "kept.parquet");
+  touch(root / "quarantine/station=a/day/old-0.partial");
+  touch(root / "station=a/year=2026/month=10/day=11/data-1.partial");
+  touch(root / "station=a/year=2026/month=10/day=11/data-1-2-3.parquet");
+  // The deepest directory the walk opens sits at kMaxDepth, so a partial
+  // there is found and one more level is reported.
+  fs::path deep = root;
+  for (unsigned i = 0; i < DirectoryWalk<PosixDirectoryIO>::kMaxDepth; ++i)
+    deep /= "l" + std::to_string(i + 1);
+  touch(deep / "at-cap.partial");
+  touch(deep / "past/below-cap.partial");
+  PosixDirectoryIO io;
+  PosixQuarantineIO mover;
+  std::vector<std::string> moved, reported;
+  std::uint32_t counter = 0;
+  auto move = [&](const char *name) {
+    char destination[416];
+    assert(aq::logger::detail::quarantine_partial(mover, root.c_str(), name,
+                                                  "b1", counter++, destination,
+                                                  sizeof(destination)));
+    moved.emplace_back(name);
+  };
+  auto too_deep = [&](const char *name) { reported.emplace_back(name); };
+  auto unreadable = [](const char *, int) { assert(false); };
+  assert(find_partials(io, root.c_str(), move, too_deep, unreadable));
+  std::sort(moved.begin(), moved.end());
+  assert(moved.size() == 3);
+  assert(moved[0] == "l1/l2/l3/l4/l5/l6/at-cap.partial");
+  assert(moved[1] == "station=a/year=2026/month=10/day=11/data-1.partial");
+  assert(moved[2] == "top-0.partial");
+  assert(reported.size() == 1 && reported[0] == "l1/l2/l3/l4/l5/l6/past");
+  assert(fs::exists(deep / "past/below-cap.partial"));
+  assert(fs::exists(root / "quarantine/station=a/day/old-0.partial"));
+  assert(fs::exists(root / "kept.parquet"));
+  // A second walk finds only what was left behind on purpose.
+  moved.clear();
+  reported.clear();
+  assert(find_partials(io, root.c_str(), move, too_deep, unreadable));
+  assert(moved.empty() && reported.size() == 1);
+  // A missing root fails with its errno instead of looking empty.
+  assert(!find_partials(io, (root / "missing").c_str(), move, too_deep,
+                        unreadable));
+  assert(errno == ENOENT);
+  fs::remove_all(temporary);
+}
+
 struct FakeListing {
   std::vector<std::string> names;
   bool fail_open = false, fail_read = false, fail_close = false;
@@ -511,6 +582,84 @@ void check_crosslink_guard() {
 }
 } // namespace
 
+// Fails inspect for names holding "bad", opendir for names holding
+// "locked" and every read of a directory named "broken".
+struct FaultyDirectoryIO : PosixDirectoryIO {
+  DIR *broken = nullptr;
+  DIR *open(const char *path) {
+    if (std::strstr(path, "locked")) {
+      errno = EACCES;
+      return nullptr;
+    }
+    DIR *directory = ::opendir(path);
+    if (directory && std::strstr(path, "broken"))
+      broken = directory;
+    return directory;
+  }
+  const struct dirent *read(DIR *directory) {
+    if (directory == broken) {
+      errno = EIO;
+      return nullptr;
+    }
+    return ::readdir(directory);
+  }
+  int inspect(const char *path, struct stat *info) {
+    if (std::strstr(path, "bad")) {
+      errno = EIO;
+      return -1;
+    }
+    return ::stat(path, info);
+  }
+};
+
+// One entry that cannot be inspected or opened is reported and skipped, and
+// the partials after it are still moved. A directory read error ends the
+// walk and is reported as a failed walk, never as a complete one.
+void check_find_partials_failures() {
+  namespace fs = std::filesystem;
+  using aq::logger::detail::find_partials;
+  char temporary[] = "/tmp/aq-find-faults-XXXXXX";
+  assert(::mkdtemp(temporary));
+  const fs::path root = fs::path(temporary) / "output";
+  const auto touch = [](const fs::path &path) {
+    fs::create_directories(path.parent_path());
+    std::ofstream(path) << "x";
+  };
+  touch(root / "a-bad.partial");
+  touch(root / "b-locked/inside-0.partial");
+  touch(root / "station=a/day/c-0.partial");
+  touch(root / "z-0.partial");
+  FaultyDirectoryIO io;
+  std::vector<std::string> moved, skipped;
+  std::vector<int> errors;
+  auto move = [&](const char *name) { moved.emplace_back(name); };
+  auto too_deep = [](const char *) { assert(false); };
+  auto unreadable = [&](const char *name, int error) {
+    skipped.emplace_back(name);
+    errors.push_back(error);
+  };
+  assert(find_partials(io, root.c_str(), move, too_deep, unreadable));
+  std::sort(moved.begin(), moved.end());
+  assert(moved.size() == 2);
+  assert(moved[0] == "station=a/day/c-0.partial" && moved[1] == "z-0.partial");
+  assert(skipped.size() == 2);
+  const bool bad_first = skipped[0] == "a-bad.partial";
+  assert(skipped[bad_first ? 0 : 1] == "a-bad.partial");
+  assert(skipped[bad_first ? 1 : 0] == "b-locked");
+  assert(errors[bad_first ? 0 : 1] == EIO);
+  assert(errors[bad_first ? 1 : 0] == EACCES);
+  // A directory that fails mid read stops the walk with its errno.
+  touch(root / "station=a/broken/d-0.partial");
+  moved.clear();
+  skipped.clear();
+  errno = 0;
+  assert(!find_partials(io, root.c_str(), move, too_deep, unreadable));
+  assert(errno == EIO);
+  assert(std::find(moved.begin(), moved.end(),
+                   "station=a/broken/d-0.partial") == moved.end());
+  fs::remove_all(temporary);
+}
+
 int main() {
   assert(check(Scenario::MountedRoot));
   assert(inspections == 1 && creations == 0);
@@ -528,5 +677,7 @@ int main() {
   check_resumable_walk();
   check_quarantine_names();
   check_same_boot_quarantine();
+  check_find_partials();
+  check_find_partials_failures();
   check_crosslink_guard();
 }

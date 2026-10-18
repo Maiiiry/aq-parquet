@@ -8,6 +8,23 @@ lives in [ble-sync-protocol.md](ble-sync-protocol.md). Files already on a phone
 or SD card are never rewritten by the firmware, so the app must keep reading
 the older shapes it has stored, or the owner clears them.
 
+## Quarantine walk error lines (fix/iterative-dir-walk, issue #37)
+
+**What changed.** The startup partial quarantine can print three new lines in
+`LOG_TAIL`. `PARQUET ERROR operation=quarantine-depth dir=<relative path>
+max_depth=6` names a directory too deep to enter. `PARQUET ERROR
+operation=quarantine-entry name=<relative path> errno=<n>` names one entry
+that could not be inspected or opened, which the walk skips before going on.
+`PARQUET ERROR operation=quarantine-walk errno=<n>` reports a directory read
+error that ended the walk early. All three raise the existing error count.
+Before, those cases were skipped with no line, and one bad entry stopped the
+rest of the walk.
+
+**Why.** The walk is now iterative so its stack is fixed, and a skipped tree
+must be visible.
+
+**What the app must do.** Nothing. It may show these as storage errors.
+
 ## LIVE key stability rule (docs only, opensensor-space-mobile #153)
 
 **What changed.** [ble-sync-protocol.md](ble-sync-protocol.md#live-key-stability)
