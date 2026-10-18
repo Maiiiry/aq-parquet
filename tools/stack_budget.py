@@ -26,11 +26,12 @@ file. It is a static estimate, a bench high water mark (`parquet mem`) is the
 measured counterpart.
 
 `--check` also fails on a tracked task with no budget, and it scans repo
-firmware (comments skipped) for every `xTaskCreate*` call in a file the image
+firmware (comments and string contents skipped) for every `xTaskCreate*` call in a file the image
 links (any of its functions in the call graph). Each one must name a tracked
 task (`task_name`, the task key by default) whose `stack_bytes` equals the
 stack size in source, so a new task or a resized stack cannot pass unnoticed.
-A call it cannot parse, such as a lambda entry or a name in a variable, fails.
+A call it cannot parse, such as a lambda entry or a name in a variable, fails,
+and so does a second creation site for one tracked task name.
 
 Usage:
   pixi run stack-budget                         # every image with a build
@@ -387,7 +388,14 @@ EXTERNAL_STACK_RE = re.compile(r"\b(xTaskCreateWithCaps|xTaskCreatePinnedToCoreW
 TASK_TOKEN_RE = re.compile(r"\bxTaskCreate\w*\s*\(")
 TASK_CREATE_RE = re.compile(r'\bxTaskCreate(?:PinnedToCore)?\s*\(\s*([A-Za-z_]\w*)\s*,\s*"([^"]*)"\s*,\s*([^,]+?)\s*,')
 CONSTANT_RE = re.compile(r"^[0-9\s*+()]+$")
-COMMENT_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.S)
+# Comments and literals in one pass, so neither hides the other. A raw string
+# R"d(...)d" ends only at its own delimiter. A quote after a word character is
+# a digit separator such as 4'096, not a character literal, except after an
+# encoding prefix (u8, u, U, L).
+COMMENT_RE = re.compile(r'(?<!\w)(?:u8|[uUL])?R"([^()\\\s"]{0,16})\(.*?\)\1"'
+                        r'|"(?:\\.|[^"\\\n])*"'
+                        r'|(?<!\w)(?:u8|[uUL])?\'(?:\\.|[^\'\\\n])*\''
+                        r'|//[^\n]*|/\*.*?\*/', re.S)
 SOURCE_SKIP = {"build", "managed_components", "vendor"}
 
 
@@ -408,11 +416,28 @@ class SourceScan:
     sites: list[TaskSite] = field(default_factory=list)
 
 
+def is_comment(token: str) -> bool:
+    return token.startswith(("//", "/*"))
+
+
 def strip_comments(text: str) -> str:
     """Blank out comments and keep string literals and line numbers."""
     def blank(match: re.Match) -> str:
         token = match.group(0)
-        return token if token[0] in "\"'" else re.sub(r"[^\n]", " ", token)
+        return re.sub(r"[^\n]", " ", token) if is_comment(token) else token
+    return COMMENT_RE.sub(blank, text)
+
+
+def blank_literals(text: str) -> str:
+    """Blank the inside of string and character literals, keeping any prefix,
+    the quotes, the length and line numbers, so call names in log text are not
+    calls."""
+    def blank(match: re.Match) -> str:
+        token = match.group(0)
+        if is_comment(token):
+            return token
+        start = min(i for i in (token.find('"'), token.find("'")) if i >= 0) + 1
+        return token[:start] + re.sub(r"[^\n]", " ", token[start:-1]) + token[-1]
     return COMMENT_RE.sub(blank, text)
 
 
@@ -442,9 +467,12 @@ def scan_sources(root: Path) -> SourceScan:
             texts[relative.as_posix()] = strip_comments(path.read_text(errors="replace"))
     scan = SourceScan()
     for name, text in texts.items():
-        for match in EXTERNAL_STACK_RE.finditer(text):
+        # Calls are found in code only. The literal text at the same offsets
+        # still gives the task name.
+        code = blank_literals(text)
+        for match in EXTERNAL_STACK_RE.finditer(code):
             scan.external.append(f"{name}:{text.count(chr(10), 0, match.start()) + 1}")
-        for token in TASK_TOKEN_RE.finditer(text):
+        for token in TASK_TOKEN_RE.finditer(code):
             where = f"{name}:{text.count(chr(10), 0, token.start()) + 1}"
             if not (match := TASK_CREATE_RE.match(text, token.start())):
                 call = " ".join(text[token.start():token.start() + 80].split(";")[0].split())
@@ -499,6 +527,14 @@ def task_site_findings(graph: Graph, spec: dict, budgets: dict, sites: list[Task
         elif copied != site.stack:
             findings.append(f"{tracked[0]} stack_bytes {copied} does not match the {site.stack} B "
                             f"stack at {site.where}")
+    # One creation site per tracked name. A second copy takes its own stack
+    # from the heap, which no budget here counts.
+    # Keys that share a task name report it once.
+    for name in sorted(set(names.values())):
+        copies = [site.where for site in here if site.parsed and site.name == name]
+        if len(copies) > 1:
+            findings.append(f'task "{name}" is created at {len(copies)} sites ({", ".join(copies)}). '
+                            "Keep one creation site per tracked task")
     created = {site.name for site in here}
     for task_name, image_task in spec["tasks"].items():
         if "stack_bytes" in image_task and names[task_name] not in created:
