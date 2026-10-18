@@ -70,6 +70,54 @@ field left no trace in what the app collects.
 shows device logs may flag a `COREDUMP` line, and parse it as space separated
 `key=value` pairs that may grow new keys. The values hold no secrets.
 
+## Bonded reconnect serves the first LIST (fix/51-ble-auth-state)
+
+**What changed.** On some bonded reconnects the board never saw the encryption
+event, so its cached "authenticated" flag stayed false while the link was in
+fact encrypted. The first `LIST` after such a reconnect was refused with
+`ERROR` 7 and that `ERROR` was dropped too, so the app saw nothing. The board
+now reads NimBLE's live security state, so that `LIST` is served. Code 7 is
+never sent for an authentication reason any more. An unpaired phone still
+sees what it saw before. NimBLE refuses its unencrypted Control write with an
+ATT Insufficient Encryption, Encryption Key Size or Authentication error, which
+starts pairing. It can still subscribe to `response`, because the CCCD has
+no security flag, but receives nothing there except a possible `ERROR` 14.
+`ERROR` 14 with
+`detail="auth"` over BLE is only a guarded fallback, for a Control write that
+passes ATT but fails the firmware check. In this configuration both apply
+the same rule, so an app should not expect to see it.
+Serial and `LOG_TAIL` gain a line `BLE BONDED authenticated=true bonds=N
+via=access`, `via=connect` or `via=subscribe` when the board learns the link
+is secure without the encryption event. A later encryption event on that
+link logs no second `BLE BONDED` line. A bonded central that encrypts
+before the board processes the connection (macOS does) now keeps the
+`response` subscription NimBLE restores from the bond. Before, that
+subscription was lost, so every frame of the first `LIST` was refused and
+its closing `ERROR` 7 never arrived. The board logs such a restore as
+`BLE SUBSCRIBE early=N response=1`, and a frame refused because `response`
+is not subscribed as `BLE REFUSE reason=unsubscribed`. No frame layout changed.
+The board also stopped rebooting on some bonded reconnects. It used to
+request the LE data length while handling the connection, and when that
+request got no answer while the phone started encryption, the BLE host reset
+and the board crashed. The data length request now goes once the link is
+secure, before the 2M PHY request, and is skipped when the phone already set
+251 octets. Serial and `LOG_TAIL` gain `BLE HCI fail cmd= op= rc= timeout=`
+when a link request fails (`timeout=1` means the BLE host resets), and
+`BLE LINK wait phy after=mtu`, `after=conn` or `after=phy`,
+`BLE LINK dle=N by central` and `BLE LINK phy=2m by central` while the link
+sequence runs. The app does not parse any of these lines.
+
+**Why.** Issue #51, a reconnect looked like a hung sync.
+
+**What the app must do.** Keep treating an ATT Insufficient Authentication,
+Encryption or Encryption Key Size error on a Control write as "pair again". That is the normal
+unpaired case. Should `ERROR` 14 ever arrive on BLE, treat it the same way,
+like a bad LAN token. Never retry either as busy. Handle 7 as
+before, by its `detail`. A plain busy 7 can be retried later, while
+`detail="mtu"` needs a larger MTU and `detail="count"` will not succeed by
+repeating the same request. Nothing for the new link lines. An app that shows
+device logs may flag `BLE HCI fail`.
+
 ## ABORT stops a LIST within one step (fix/33-abort-list-walk)
 
 **What changed.** The device walks the card for `LIST` in steps of at most 32

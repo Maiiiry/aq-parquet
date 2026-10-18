@@ -52,7 +52,8 @@ struct Options {
   // Fast advertising after an advert flag flips, so a low-power scanner
   // filtering on the flag byte sees it within a minute.
   std::uint32_t flag_window_ms = 60000;
-  // LE data length request on connect: 251 octets at 1M PHY timing.
+  // LE data length request once the link is secure: 251 octets at 1M PHY
+  // timing.
   std::uint16_t data_len_octets = 251;
   std::uint16_t data_len_time_us = 2120;
   bool prefer_2m_phy = true;
@@ -308,4 +309,37 @@ private:
   std::int64_t last_us_ = 0;
   bool relaxed_ = false;
 };
+
+// Where the post-connect link sequence is, see link_on_host() in ble_sync.cpp.
+enum class LinkStep : std::uint8_t { Idle, Dle, Phy, Interval, Done };
+
+// The Dle step asks for `want` TX octets only when the central's own data
+// length update did not already reach it. `central_tx_octets` is the last
+// DATA_LEN_CHG max_tx_octets on this link, 0 when none came.
+[[nodiscard]] constexpr bool dle_request_needed(std::uint16_t central_tx_octets,
+                                                std::uint16_t want) {
+  return central_tx_octets < want;
+}
+
+// A procedure the central ran (MTU exchange, connection update, PHY update)
+// while the local PHY request still waits. The wait starts over, so the PHY
+// request goes out only after a full settle with no central procedure. An
+// Android central's MTU 517 exchange and connection update land about 2 s
+// after a link that was secure at CONNECT, where the old fixed wait put the
+// PHY request (CoreS3 bench 2026-10-18). The host sees a central's connection
+// update only after its instant, so this narrows the window for crossing it
+// (the lld_con.c 3275 controller assert) and cannot close it.
+[[nodiscard]] constexpr bool central_procedure_rearms(LinkStep step) {
+  return step == LinkStep::Phy;
+}
+
+// The 2M PHY code in HCI and NimBLE (BLE_GAP_LE_PHY_2M).
+constexpr std::uint8_t kPhy2M = 2;
+// The PHY step asks for 2M only when the link is not on 2M both ways, so a
+// central that already moved the link to 2M sees no local procedure. A failed
+// read asks, as before.
+[[nodiscard]] constexpr bool phy_request_needed(bool read_ok, std::uint8_t tx,
+                                                std::uint8_t rx) {
+  return !read_ok || tx != kPhy2M || rx != kPhy2M;
+}
 } // namespace ble

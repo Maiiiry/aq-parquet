@@ -1,6 +1,7 @@
 #include "ble_sync.h"
 #include "abort_signal.h"
 #include "ble_advert.h"
+#include "ble_link_auth.h"
 #include "ble_policy.h"
 #include "debug_log.h"
 #include "disconnect.h"
@@ -30,6 +31,7 @@ void ble_store_config_init(void);
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <span>
 
 namespace ble {
 namespace {
@@ -49,6 +51,7 @@ ble_uuid128_t native_uuid(std::uint16_t selector) {
 const ble_uuid128_t uuids[] = {native_uuid(1), native_uuid(2), native_uuid(3),
                                native_uuid(4), native_uuid(5), native_uuid(6)};
 enum Characteristic : unsigned { Info, Status, Live, Control, Response, Count };
+static_assert(Count <= PendingCccd::kMax, "every CCCD restore must fit");
 char name_text[16]{};
 char info_text[400]{};
 char status_text[kMaxJson + 1] = "{}", live_text[kMaxJson + 1] = "{}";
@@ -63,6 +66,11 @@ std::atomic<bool> enabled{false}, advertising{false}, connected{false},
 std::atomic<std::uint16_t> conn_handle{BLE_HS_CONN_HANDLE_NONE}, mtu{0};
 std::atomic<std::uint32_t> passkey{0}, bonds{0}, generation{0}, ui{0};
 std::atomic<std::int64_t> pairing_deadline{0};
+// SUBSCRIBE events for a handle whose CONNECT has not run yet, applied at
+// CONNECT (ble_link_auth.h). Host task only.
+PendingCccd early_cccd;
+// The last session a fault refusal was logged for, so it logs once.
+std::atomic<std::uint32_t> refusal_logged{~0U};
 // Why this side asked the controller to terminate. The controller reports a
 // local termination as HCI 0x16, which carries no reason of its own.
 std::atomic<DisconnectReason> pending_reason{DisconnectReason::Unknown};
@@ -119,11 +127,13 @@ FlagWatch flag_watch; // host task only
 std::atomic<bool> advert_published{false};
 ble_npl_callout retry_callout{}, relax_callout{}, advertise_callout{},
     link_callout{};
+static_assert(kPhy2M == BLE_GAP_LE_PHY_2M);
 // Where the post-connect link sequence is, see link_on_host().
-enum class LinkStep : std::uint8_t { Idle, Phy, Interval, Done };
 LinkStep link_step = LinkStep::Idle; // host task only
-AdvertWindow adv_window;             // host task only
-IntervalPolicy interval;             // host task only
+// The last DATA_LEN_CHG max_tx_octets on this link, 0 for none. Host task.
+std::uint16_t dle_tx_octets = 0;
+AdvertWindow adv_window; // host task only
+IntervalPolicy interval; // host task only
 std::atomic<bool> adv_fast{false};
 std::atomic<unsigned> pending_snapshots{0};
 std::atomic<bool> startup_ok{false}, host_requested{false};
@@ -148,6 +158,33 @@ bool secure(std::uint16_t handle) {
   return ble_gap_conn_find(handle, &desc) == 0 && desc.sec_state.encrypted &&
          (mode == config::PairMode::None ||
           (desc.sec_state.authenticated && desc.sec_state.key_size == 16));
+}
+
+// The response gates (ble_link_auth.h). The cached flag, else the ERROR 14
+// refusal, else NimBLE's live state, so a missed ENC_CHANGE never refuses a
+// secure link. Safe from any task: ble_gap_conn_find() takes the host lock.
+bool may_send_frame(std::uint16_t handle, const std::uint8_t *data,
+                    std::size_t length) {
+  return may_send(authenticated.load(),
+                  std::span<const std::uint8_t>(data, length),
+                  [handle] { return secure(handle); });
+}
+
+// The response stream gate for one frame of `session` on `handle`. A fault
+// refusal (not subscribed, not secure) logs BLE REFUSE once per session, so
+// the bench sees why before the worker's ERROR and LIST ABORT lines.
+[[nodiscard]] GateRefusal response_gate(std::uint32_t session,
+                                        std::uint16_t handle,
+                                        const std::uint8_t *data,
+                                        std::size_t length) {
+  const auto refusal = response_refusal(
+      connected.load(),
+      generation.load() == session && conn_handle.load() == handle,
+      subscribed[Response].load(),
+      [&] { return may_send_frame(handle, data, length); });
+  if (refusal_is_fault(refusal) && refusal_logged.exchange(session) != session)
+    aqlog.printf("BLE REFUSE reason=%s\n", refusal_name(refusal));
+  return refusal;
 }
 
 bool apply_advert_data() {
@@ -249,8 +286,9 @@ int notify_on_host(Characteristic which, const std::uint8_t *data,
                    std::uint16_t handle) {
   if (!data || length == 0 || length > kMaxFrame || length > payload_max())
     return BLE_HS_EMSGSIZE;
-  if (!connected.load() || !authenticated.load() || !subscribed[which].load() ||
-      generation.load() != session || conn_handle.load() != handle)
+  if (!connected.load() || !subscribed[which].load() ||
+      generation.load() != session || conn_handle.load() != handle ||
+      !may_send_frame(handle, data, length))
     return BLE_HS_ENOTCONN;
   // Native custom notifications consume the mbuf on success AND failure.
   // Each retry must allocate a fresh buffer containing the same whole frame.
@@ -325,9 +363,9 @@ void drain_responses(ble_npl_event *) {
     portEXIT_CRITICAL(&tx_lock);
     if (!any)
       break;
-    if (!connected.load() || !authenticated.load() ||
-        !subscribed[Response].load() || generation.load() != slot.session ||
-        conn_handle.load() != slot.handle) {
+    if (response_gate(slot.session, slot.handle,
+                      tx_frames + std::size_t(head) * kMaxFrame,
+                      slot.length) != GateRefusal::None) {
       // The phone unsubscribed or the session ended. The stream is over for
       // this session, but the link itself did nothing wrong.
       close_responses();
@@ -392,8 +430,7 @@ aqsync::EnqueueResult enqueue_response(const std::uint8_t *data,
   if (!data || !length || length > kMaxFrame || length > payload_max())
     return aqsync::EnqueueResult::Closed;
   const auto handle = conn_handle.load();
-  if (!connected.load() || !authenticated.load() ||
-      !subscribed[Response].load() || generation.load() != session)
+  if (response_gate(session, handle, data, length) != GateRefusal::None)
     return aqsync::EnqueueResult::Closed;
   portENTER_CRITICAL(&tx_lock);
   const auto reservation = responses.reserve(session, esp_timer_get_time());
@@ -415,6 +452,16 @@ aqsync::EnqueueResult enqueue_response(const std::uint8_t *data,
   return aqsync::EnqueueResult::Ok;
 }
 
+// A link command NimBLE refused or the controller failed. rc 19
+// (BLE_HS_ETIMEOUT_HCI) means no ack within 2 s, and NimBLE resets the host
+// right after, so this line names the command that started the reset.
+void log_hci_fail(const char *command, std::uint16_t opcode, int rc) {
+  if (rc == 0)
+    return;
+  aqlog.printf("BLE HCI fail cmd=%s op=0x%04x rc=%d timeout=%u\n", command,
+               unsigned(opcode), rc, unsigned(rc == BLE_HS_ETIMEOUT_HCI));
+}
+
 int request_conn_params(std::uint16_t handle, const ConnParams &p,
                         const char *label) {
   ble_gap_upd_params params{};
@@ -427,6 +474,8 @@ int request_conn_params(std::uint16_t handle, const ConnParams &p,
       "BLE CONN request=%s itvl=%u-%u lat=%u to=%u rc=%d\n", label,
       unsigned(p.itvl_min), unsigned(p.itvl_max), unsigned(p.latency),
       unsigned(p.supervision_timeout), rc);
+  log_hci_fail("conn", BLE_HCI_OP(BLE_HCI_OGF_LE, BLE_HCI_OCF_LE_CONN_UPDATE),
+               rc);
   return rc;
 }
 
@@ -457,8 +506,11 @@ void relax_on_host(ble_npl_event *) {
 // connection update both carry an instant, and the ESP32-S3 controller
 // asserted in its local connection update (lld_con.c 3275) when an iPad's
 // own CONNECTION_UPDATE_IND crossed ours during the bonded reconnect
-// (bench 2026-10-12). Data length has no instant, so it goes at connect.
-// PHY waits for encryption to settle, the interval waits for the PHY.
+// (bench 2026-10-12). No link request is sent from CONNECT. A data length
+// request there timed out while a bonded phone started encryption, and the
+// host reset that followed crashed on the stale ack (core dumps 2026-10-18).
+// Data length goes once the link is secure, PHY waits for the central to
+// settle, the interval waits for the PHY.
 constexpr std::uint32_t kLinkSettleMs = 2000;
 constexpr std::uint32_t kPhyWaitMs = 2000;
 
@@ -474,13 +526,39 @@ void link_on_host(ble_npl_event *) {
   if (!connected.load() || !authenticated.load())
     return;
   const auto handle = conn_handle.load();
+  if (link_step == LinkStep::Dle) {
+    link_step = LinkStep::Phy;
+    if (dle_request_needed(dle_tx_octets, options.data_len_octets)) {
+      const int rc = ble_gap_set_data_len(handle, options.data_len_octets,
+                                          options.data_len_time_us);
+      aqlog.record_only().printf("BLE LINK request dle=%u/%u rc=%d\n",
+                                 unsigned(options.data_len_octets),
+                                 unsigned(options.data_len_time_us), rc);
+      log_hci_fail("dle",
+                   BLE_HCI_OP(BLE_HCI_OGF_LE, BLE_HCI_OCF_LE_SET_DATA_LEN), rc);
+    } else
+      aqlog.record_only().printf("BLE LINK dle=%u by central\n",
+                                 unsigned(dle_tx_octets));
+    ble_npl_callout_reset(&link_callout,
+                          ble_npl_time_ms_to_ticks32(kLinkSettleMs));
+    return;
+  }
   if (link_step == LinkStep::Phy) {
     link_step = LinkStep::Interval;
-    if (options.prefer_2m_phy) {
+    std::uint8_t tx = 0, rx = 0;
+    const int read =
+        options.prefer_2m_phy ? ble_gap_read_le_phy(handle, &tx, &rx) : 0;
+    log_hci_fail("read_phy", BLE_HCI_OP(BLE_HCI_OGF_LE, BLE_HCI_OCF_LE_RD_PHY),
+                 read);
+    if (options.prefer_2m_phy && !phy_request_needed(read == 0, tx, rx)) {
+      aqlog.record_only().println("BLE LINK phy=2m by central");
+    } else if (options.prefer_2m_phy) {
       const int rc = ble_gap_set_prefered_le_phy(handle, BLE_GAP_LE_PHY_2M_MASK,
                                                  BLE_GAP_LE_PHY_2M_MASK,
                                                  BLE_GAP_LE_PHY_CODED_ANY);
       aqlog.record_only().printf("BLE LINK request phy=2m rc=%d\n", rc);
+      log_hci_fail("phy", BLE_HCI_OP(BLE_HCI_OGF_LE, BLE_HCI_OCF_LE_SET_PHY),
+                   rc);
       if (rc == 0) {
         // PHY_UPDATE_COMPLETE moves on sooner; this is the fallback.
         ble_npl_callout_reset(&link_callout,
@@ -504,22 +582,43 @@ void link_on_host(ble_npl_event *) {
     link_step = LinkStep::Done;
 }
 
-void request_link_parameters(std::uint16_t handle) {
-  link_step = LinkStep::Idle;
-  const int dle = ble_gap_set_data_len(handle, options.data_len_octets,
-                                       options.data_len_time_us);
-  aqlog.record_only().printf("BLE LINK request dle=%u/%u rc=%d\n",
-                             unsigned(options.data_len_octets),
-                             unsigned(options.data_len_time_us), dle);
-}
-
-// Called once the link is encrypted and authenticated.
+// Called once the link is encrypted and authenticated, from a GAP event. The
+// first command goes out on the next turn of the host's event queue.
 void start_link_sequence() {
   if (link_step != LinkStep::Idle)
     return;
-  link_step = LinkStep::Phy;
+  link_step = LinkStep::Dle;
+  ble_npl_callout_reset(&link_callout, 0);
+}
+
+// The central ran a procedure of its own on `handle`. While the PHY request
+// still waits, the wait starts over (ble_policy.h). Host task only.
+void defer_link_step(std::uint16_t handle, const char *after) {
+  if (handle != conn_handle.load() || !central_procedure_rearms(link_step))
+    return;
   ble_npl_callout_reset(&link_callout,
                         ble_npl_time_ms_to_ticks32(kLinkSettleMs));
+  aqlog.record_only().printf("BLE LINK wait phy after=%s\n", after);
+}
+
+// Host task only. Reads NimBLE's security state for `handle` and, the first
+// time it proves the current link secure, latches `authenticated` the way
+// ENC_CHANGE does. `via` names where the proof came from for the bench log.
+// Returns the live state.
+bool confirm_secure(std::uint16_t handle, const char *via) {
+  const bool secure_now = secure(handle);
+  if (!should_latch(connected.load() && handle == conn_handle.load(),
+                    authenticated.load(), secure_now))
+    return secure_now;
+  authenticated = true;
+  pairing_active = false;
+  passkey = 0;
+  update_bonds();
+  touch_ui();
+  aqlog.printf("BLE BONDED authenticated=true bonds=%lu via=%s\n",
+               static_cast<unsigned long>(bonds.load()), via);
+  start_link_sequence();
+  return true;
 }
 
 bool defer_error(Op op, Error code, const char *detail, std::uint32_t session) {
@@ -541,9 +640,27 @@ int access(std::uint16_t handle, std::uint16_t, ble_gatt_access_ctxt *ctxt,
            void *arg) {
   const auto which =
       static_cast<Characteristic>(reinterpret_cast<std::uintptr_t>(arg));
-  if (!secure(handle))
+  if (!confirm_secure(handle, "access")) {
+    // Not reached in this configuration. NimBLE's ATT permission check
+    // applies the same rule as secure() (ble_att_svr_check_perms with the
+    // ENC flags, plus AUTHEN and sm_sc_only in the passkey modes) and its
+    // ATT error is what makes a phone pair. If the checks ever diverge, a
+    // Control write is refused by ERROR 14 on `response` alone. It is
+    // acknowledged and not dispatched, because an ATT error would fail the
+    // client's write before it could read the ERROR.
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && which == Control) {
+      std::uint8_t op = 0;
+      if (OS_MBUF_PKTLEN(ctxt->om) > 0)
+        os_mbuf_copydata(ctxt->om, 0, 1, &op);
+      const auto refusal = control_refusal(false);
+      // If the error queue is full the ATT error below still refuses it.
+      if (defer_error(static_cast<Op>(op), refusal.code, refusal.detail,
+                      generation.load()))
+        return 0;
+    }
     return mode == config::PairMode::None ? BLE_ATT_ERR_INSUFFICIENT_ENC
                                           : BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+  }
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     if (which == Info)
       return os_mbuf_append(ctxt->om, info_text, std::strlen(info_text)) == 0
@@ -598,21 +715,49 @@ int access(std::uint16_t handle, std::uint16_t, ble_gatt_access_ctxt *ctxt,
     aqsync::abort::commit(request);
     return 0;
   }
-  if (!defer_error(static_cast<Op>(request.bytes[0]), kErrBusy, "queue-full",
-                   request.link_generation))
+  // The link is secure here, so the only refusal left is the full queue.
+  const auto refusal = control_refusal(true);
+  if (!defer_error(static_cast<Op>(request.bytes[0]), refusal.code,
+                   refusal.detail, request.link_generation))
     return BLE_ATT_ERR_INSUFFICIENT_RES;
   return 0;
+}
+
+// One characteristic's subscribe state on the current link, from a live
+// CCCD write or from a restore held until CONNECT. Host task only.
+void apply_subscribe(Characteristic which, bool notify, bool closing) {
+  subscribed[which] = notify;
+  if (which != Response || !connected.load())
+    return;
+  // Turning response notifications off ends the stream at once. On again
+  // starts a new generation, so requests and handles of the old stream end
+  // Closed or ERROR 5 instead of resuming mid stream.
+  portENTER_CRITICAL(&tx_lock);
+  const bool open = responses.open_for(generation.load());
+  portEXIT_CRITICAL(&tx_lock);
+  const auto change = response_subscribe(notify, closing, open);
+  if (change == StreamChange::Close) {
+    close_responses();
+  } else if (change == StreamChange::Reopen) {
+    const auto session = ++generation;
+    portENTER_CRITICAL(&tx_lock);
+    responses.open(session, esp_timer_get_time());
+    portEXIT_CRITICAL(&tx_lock);
+    aqlog.record_only().println("BLE STREAM reopen");
+  }
 }
 
 int gap_event(ble_gap_event *event, void *) {
   switch (event->type) {
   case BLE_GAP_EVENT_CONNECT:
     if (event->connect.status != 0) {
+      early_cccd.clear();
       if (enabled.load() && host_requested.load())
         start_advertising();
       return 0;
     }
     if (!host_requested.load()) {
+      early_cccd.clear();
       terminate(event->connect.conn_handle, DisconnectReason::ServerStop);
       return 0;
     }
@@ -620,9 +765,11 @@ int gap_event(ble_gap_event *event, void *) {
     conn_handle = event->connect.conn_handle;
     mtu = ble_att_mtu(event->connect.conn_handle);
     advertising = false;
-    authenticated = secure(event->connect.conn_handle);
+    authenticated = false;
     connected = true;
     std::fill(std::begin(subscribed), std::end(subscribed), false);
+    link_step = LinkStep::Idle;
+    dle_tx_octets = 0;
     {
       const auto now = esp_timer_get_time();
       portENTER_CRITICAL(&tx_lock);
@@ -635,7 +782,16 @@ int gap_event(ble_gap_event *event, void *) {
     }
     touch_ui();
     aqlog.printf("BLE CONNECT mtu=%u\n", unsigned(mtu.load()));
-    request_link_parameters(event->connect.conn_handle);
+    // Subscriptions NimBLE restored or the client wrote before this event
+    // count exactly like a CCCD write after it.
+    if (const auto held = early_cccd.replay(
+            event->connect.conn_handle, [](unsigned i, bool notify) {
+              apply_subscribe(static_cast<Characteristic>(i), notify, false);
+            }))
+      aqlog.printf("BLE SUBSCRIBE early=%u response=%u\n", held,
+                   unsigned(subscribed[Response].load()));
+    // Already secure at connect, which ENC_CHANGE would never report.
+    confirm_secure(event->connect.conn_handle, "connect");
     return 0;
   case BLE_GAP_EVENT_DISCONNECT: {
     const auto local = pending_reason.exchange(DisconnectReason::Unknown);
@@ -656,6 +812,8 @@ int gap_event(ble_gap_event *event, void *) {
     mtu = 0;
     ++generation;
     std::fill(std::begin(subscribed), std::end(subscribed), false);
+    early_cccd.clear();
+    dle_tx_octets = 0;
     close_responses();
     ble_npl_callout_stop(&relax_callout);
     ble_npl_callout_stop(&link_callout);
@@ -672,47 +830,45 @@ int gap_event(ble_gap_event *event, void *) {
     return 0;
   }
   case BLE_GAP_EVENT_MTU:
+    defer_link_step(event->mtu.conn_handle, "mtu");
     if (event->mtu.conn_handle == conn_handle.load()) {
       mtu = event->mtu.value;
       touch_ui();
       aqlog.printf("BLE MTU mtu=%u\n", unsigned(event->mtu.value));
     }
     return 0;
-  case BLE_GAP_EVENT_SUBSCRIBE:
-    if (event->subscribe.conn_handle != conn_handle.load())
+  case BLE_GAP_EVENT_SUBSCRIBE: {
+    const auto route = route_subscribe(
+        connected.load(), event->subscribe.conn_handle == conn_handle.load());
+    if (route == SubscribeRoute::Drop)
       return 0;
-    for (unsigned i = 0; i < Count; ++i) {
-      if (event->subscribe.attr_handle != value_handles[i])
-        continue;
-      const bool notify = event->subscribe.cur_notify != 0;
-      subscribed[i] = notify;
-      if (i != Response || !connected.load())
-        continue;
-      // Turning response notifications off ends the stream at once. On again
-      // starts a new generation, so requests and handles of the old stream
-      // end Closed or ERROR 5 instead of resuming mid stream.
-      portENTER_CRITICAL(&tx_lock);
-      const bool open = responses.open_for(generation.load());
-      portEXIT_CRITICAL(&tx_lock);
-      const auto change = response_subscribe(
-          notify, event->subscribe.reason == BLE_GAP_SUBSCRIBE_REASON_TERM,
-          open);
-      if (change == StreamChange::Close) {
-        close_responses();
-      } else if (change == StreamChange::Reopen) {
-        const auto session = ++generation;
-        portENTER_CRITICAL(&tx_lock);
-        responses.open(session, esp_timer_get_time());
-        portEXIT_CRITICAL(&tx_lock);
-        aqlog.record_only().println("BLE STREAM reopen");
-      }
+    const bool closing =
+        event->subscribe.reason == BLE_GAP_SUBSCRIBE_REASON_TERM;
+    const bool notify = event->subscribe.cur_notify != 0;
+    if (route == SubscribeRoute::Hold) {
+      // CONNECT has not run yet, typically a bonded CCCD that NimBLE restored
+      // when the central encrypted early. CONNECT applies it.
+      for (unsigned i = 0; i < Count; ++i)
+        if (event->subscribe.attr_handle == value_handles[i])
+          early_cccd.hold(event->subscribe.conn_handle, i, notify);
+      return 0;
     }
+    // A CCCD write proves nothing by itself, but it is the first event a
+    // client sends after a reconnect, so a missed ENC_CHANGE latches here.
+    // Not during teardown, which reports every CCCD as turned off.
+    if (!closing)
+      confirm_secure(event->subscribe.conn_handle, "subscribe");
+    for (unsigned i = 0; i < Count; ++i)
+      if (event->subscribe.attr_handle == value_handles[i])
+        apply_subscribe(static_cast<Characteristic>(i), notify, closing);
     return 0;
-  case BLE_GAP_EVENT_ENC_CHANGE:
+  }
+  case BLE_GAP_EVENT_ENC_CHANGE: {
     if (event->enc_change.conn_handle != conn_handle.load())
       return 0;
     pairing_active = false;
     passkey = 0;
+    const bool was = authenticated.load();
     authenticated =
         event->enc_change.status == 0 && secure(event->enc_change.conn_handle);
     update_bonds();
@@ -720,12 +876,13 @@ int gap_event(ble_gap_event *event, void *) {
     if (!authenticated.load()) {
       aqlog.println("BLE AUTH result=failed action=disconnect");
       terminate(event->enc_change.conn_handle, DisconnectReason::AuthFailed);
-    } else {
+    } else if (enc_change_announces(was, true)) {
       aqlog.printf("BLE BONDED authenticated=true bonds=%lu\n",
                    static_cast<unsigned long>(bonds.load()));
       start_link_sequence();
     }
     return 0;
+  }
   case BLE_GAP_EVENT_PASSKEY_ACTION: {
     if (mode == config::PairMode::None ||
         event->passkey.params.action != BLE_SM_IOACT_DISP)
@@ -768,6 +925,7 @@ int gap_event(ble_gap_event *event, void *) {
     }
     return 0;
   case BLE_GAP_EVENT_CONN_UPDATE: {
+    defer_link_step(event->conn_update.conn_handle, "conn");
     ble_gap_conn_desc desc{};
     if (event->conn_update.conn_handle == conn_handle.load() &&
         ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0)
@@ -778,6 +936,8 @@ int gap_event(ble_gap_event *event, void *) {
     return 0;
   }
   case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+    // A PHY update before our request is the central's own.
+    defer_link_step(event->phy_updated.conn_handle, "phy");
     if (event->phy_updated.conn_handle == conn_handle.load() &&
         link_step == LinkStep::Interval)
       ble_npl_callout_reset(&link_callout, ble_npl_time_ms_to_ticks32(200));
@@ -788,12 +948,15 @@ int gap_event(ble_gap_event *event, void *) {
                                  event->phy_updated.status);
     return 0;
   case BLE_GAP_EVENT_DATA_LEN_CHG:
-    if (event->data_len_chg.conn_handle == conn_handle.load())
-      aqlog.record_only().printf("BLE DLE tx=%u/%u rx=%u/%u\n",
-                                 unsigned(event->data_len_chg.max_tx_octets),
-                                 unsigned(event->data_len_chg.max_tx_time),
-                                 unsigned(event->data_len_chg.max_rx_octets),
-                                 unsigned(event->data_len_chg.max_rx_time));
+    if (event->data_len_chg.conn_handle != conn_handle.load())
+      return 0;
+    // The Dle step skips a length the central already set.
+    dle_tx_octets = event->data_len_chg.max_tx_octets;
+    aqlog.record_only().printf("BLE DLE tx=%u/%u rx=%u/%u\n",
+                               unsigned(event->data_len_chg.max_tx_octets),
+                               unsigned(event->data_len_chg.max_tx_time),
+                               unsigned(event->data_len_chg.max_rx_octets),
+                               unsigned(event->data_len_chg.max_rx_time));
     return 0;
   default:
     return 0;
@@ -819,6 +982,8 @@ void on_reset(int reason) {
   mtu = 0;
   ++generation;
   std::fill(std::begin(subscribed), std::end(subscribed), false);
+  early_cccd.clear();
+  dle_tx_octets = 0;
   close_responses();
   ble_npl_callout_stop(&relax_callout);
   ble_npl_callout_stop(&link_callout);

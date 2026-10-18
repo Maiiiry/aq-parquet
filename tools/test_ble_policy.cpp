@@ -1,12 +1,18 @@
 // Exercise the real BLE link policy (notify credits, the response queue, slow
-// peer close, advert flag flips, advert window, interval mode and parameter
-// validation) on the host. Run with
+// peer close, advert flag flips, advert window, interval mode, parameter
+// validation and the link authentication gates) on the host. Run with
 // tools/test_ble_policy.py.
+#include <ble_link_auth.h>
 #include <ble_policy.h>
 
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <span>
+#include <string_view>
+#include <utility>
 
 using aqsync::EnqueueResult;
 using ble::AdvertWindow;
@@ -543,6 +549,451 @@ void test_flag_watch() {
   assert(!same.on_publish(0x01));
   assert(same.on_publish(0x03));
 }
+// Link authentication (issue #51). The transport answers what these decide;
+// the frames below are built the way ble_sync.cpp encodes them.
+std::array<std::uint8_t, 7> error_frame(ble::Op op, ble::Error code) {
+  return {ble::kFrameError, op, code, 'a', 'u', 't', 'h'};
+}
+
+// What one ble_sync.cpp gate does for a frame: the cached flag, the ERROR 14
+// exception, then NimBLE's live state, counting live lookups.
+struct Gate {
+  bool cached = false;
+  bool live_secure = false;
+  int lookups = 0;
+  bool send(std::span<const std::uint8_t> frame) {
+    return ble::may_send(cached, frame, [this] {
+      ++lookups;
+      return live_secure;
+    });
+  }
+};
+
+static_assert(ble::should_latch(true, false, true), "first proof latches");
+static_assert(!ble::should_latch(true, true, true), "latched once");
+static_assert(!ble::should_latch(false, false, true), "another handle");
+static_assert(!ble::should_latch(true, false, false), "insecure never");
+static_assert(ble::control_refusal(false).code == ble::kErrAuth,
+              "auth refusal is 14");
+static_assert(ble::control_refusal(true).code == ble::kErrBusy,
+              "queue refusal is 7");
+// The full send or refuse table. A cached-only gate (the issue #51 bug)
+// fails the live-secure row.
+static_assert(ble::gate_allows(true, false, false), "cached link sends");
+static_assert(ble::gate_allows(false, false, true), "stale flag, secure link");
+static_assert(ble::gate_allows(false, true, false), "ERROR 14 always out");
+static_assert(!ble::gate_allows(false, false, false), "insecure refused");
+// A late ENC_CHANGE after a via= latch announces nothing.
+static_assert(ble::enc_change_announces(false, true), "first ENC_CHANGE");
+static_assert(!ble::enc_change_announces(true, true), "already latched");
+static_assert(!ble::enc_change_announces(false, false), "insecure");
+
+void test_stale_flag_secure_link_is_served() {
+  // The failing bench connect: CONNECT before encryption leaves the flag
+  // false and ENC_CHANGE never arrives, yet NimBLE says the link is secure.
+  Gate gate{.cached = false, .live_secure = true, .lookups = 0};
+  const std::uint8_t file_frame[] = {ble::kFrameFile, 0, 0, 0, 0, 'a'};
+  const std::uint8_t list_end[] = {ble::kFrameListEnd, 1, 0, 0, 0};
+  assert(gate.send(file_frame));
+  assert(gate.send(list_end));
+  assert(gate.lookups == 2);
+  // A busy ERROR on that link still goes out, so a real 7 stays visible.
+  const auto busy = error_frame(ble::kOpList, ble::kErrBusy);
+  assert(gate.send(busy));
+
+  // The first GATT access then latches the flag, and the gates stop asking
+  // NimBLE for every frame.
+  const bool current_link = true;
+  assert(ble::should_latch(current_link, gate.cached, gate.live_secure));
+  gate.cached = true;
+  gate.lookups = 0;
+  assert(gate.send(file_frame) && gate.send(list_end) && gate.lookups == 0);
+  assert(!ble::should_latch(current_link, gate.cached, gate.live_secure));
+}
+
+void test_insecure_link_gets_visible_error_14() {
+  Gate gate{.cached = false, .live_secure = false, .lookups = 0};
+  // NimBLE's ATT check refuses an insecure Control write first. If it ever
+  // lets one through, access() queues this refusal as the fallback.
+  const auto refusal = ble::control_refusal(false);
+  assert(refusal.code == ble::kErrAuth &&
+         std::strcmp(refusal.detail, "auth") == 0);
+  const auto frame = error_frame(ble::kOpList, refusal.code);
+  assert(ble::is_auth_refusal(frame));
+  // The gate lets it out without asking NimBLE, so the client sees it.
+  assert(gate.send(frame) && gate.lookups == 0);
+  // Nothing else reaches an insecure link: no data, no snapshot, no other
+  // ERROR, and no latch.
+  const std::uint8_t file_frame[] = {ble::kFrameFile, 0, 0, 0, 0, 'a'};
+  const std::uint8_t status_json[] = {'{', '}'};
+  assert(!gate.send(file_frame));
+  assert(!gate.send(status_json));
+  assert(!gate.send(error_frame(ble::kOpList, ble::kErrBusy)));
+  assert(!ble::should_latch(true, gate.cached, gate.live_secure));
+}
+
+void test_no_auth_refusal_answers_busy() {
+  // An auth reason is never code 7, and code 7 is only the full queue.
+  assert(ble::control_refusal(false).code != ble::kErrBusy);
+  const auto queue = ble::control_refusal(true);
+  assert(queue.code == ble::kErrBusy &&
+         std::strcmp(queue.detail, "queue-full") == 0);
+  // Only a whole ERROR 14 frame counts as the auth refusal.
+  assert(!ble::is_auth_refusal(error_frame(ble::kOpList, ble::kErrBusy)));
+  const std::uint8_t short_frame[] = {ble::kFrameError, ble::kOpList};
+  assert(!ble::is_auth_refusal(short_frame));
+  const std::uint8_t not_error[] = {ble::kFrameFile, ble::kOpList,
+                                    ble::kErrAuth};
+  assert(!ble::is_auth_refusal(not_error));
+  assert(!ble::is_auth_refusal(std::span<const std::uint8_t>{}));
+}
+// The bonded reconnect from the 2026-10-18 bench. A model of ble_sync.cpp's
+// gap_event built from the same decisions, in NimBLE's event order.
+// test_ble_policy.py checks that ble_sync.cpp wires them the same way.
+constexpr unsigned kResponse = 4; // ble_sync.cpp Characteristic::Response
+struct Transport {
+  bool connected = false;
+  bool authenticated = false;
+  bool live_secure = false;
+  std::uint16_t handle = ble::PendingCccd::kNone;
+  std::uint32_t generation = 0;
+  std::array<bool, 5> subscribed{};
+  ble::PendingCccd early;
+  ResponseQueue queue = queue_for(0);
+  int fault_logs = 0;
+  std::uint32_t refusal_logged = ~0U;
+
+  void apply(unsigned which, bool notify, bool closing) {
+    subscribed[which] = notify;
+    if (which != kResponse || !connected)
+      return;
+    const auto change =
+        ble::response_subscribe(notify, closing, queue.open_for(generation));
+    if (change == StreamChange::Close)
+      queue.close();
+    else if (change == StreamChange::Reopen)
+      queue.open(++generation, 0);
+  }
+  void on_subscribe(std::uint16_t event_handle, unsigned which, bool notify,
+                    bool closing = false) {
+    switch (ble::route_subscribe(connected, event_handle == handle)) {
+    case ble::SubscribeRoute::Drop:
+      return;
+    case ble::SubscribeRoute::Hold:
+      early.hold(event_handle, which, notify);
+      return;
+    case ble::SubscribeRoute::Apply:
+      if (!closing && ble::should_latch(true, authenticated, live_secure))
+        authenticated = true;
+      apply(which, notify, closing);
+    }
+  }
+  // ENC_CHANGE before CONNECT goes nowhere, the handle is not known yet.
+  void on_enc_change(std::uint16_t event_handle) {
+    live_secure = true;
+    if (connected && event_handle == handle)
+      authenticated = true;
+  }
+  void on_connect(std::uint16_t event_handle) {
+    ++generation;
+    handle = event_handle;
+    authenticated = false;
+    connected = true;
+    subscribed.fill(false);
+    queue.open(generation, 0);
+    early.replay(event_handle, [this](unsigned which, bool notify) {
+      apply(which, notify, false);
+    });
+    if (ble::should_latch(true, authenticated, live_secure))
+      authenticated = true;
+  }
+  void on_disconnect() {
+    connected = false;
+    authenticated = false;
+    handle = ble::PendingCccd::kNone;
+    ++generation;
+    subscribed.fill(false);
+    early.clear();
+    queue.close();
+  }
+  // enqueue_response(): the gate, then a credit.
+  EnqueueResult send(std::span<const std::uint8_t> frame) {
+    Gate gate{
+        .cached = authenticated, .live_secure = live_secure, .lookups = 0};
+    const auto refusal =
+        ble::response_refusal(connected, true, subscribed[kResponse],
+                              [&] { return gate.send(frame); });
+    if (ble::refusal_is_fault(refusal) &&
+        std::exchange(refusal_logged, generation) != generation)
+      ++fault_logs;
+    if (refusal != ble::GateRefusal::None)
+      return EnqueueResult::Closed;
+    const auto r = queue.reserve(generation, 0);
+    if (r.result != EnqueueResult::Ok)
+      return r.result;
+    if (!queue.publish(r, generation, static_cast<std::uint16_t>(frame.size()),
+                       handle))
+      return EnqueueResult::Closed;
+    TxSlot slot;
+    std::uint8_t index = 0;
+    assert(queue.front(slot, index));
+    assert(queue.on_notify_tx(generation, NotifyStatus::Sent, 0).current);
+    return EnqueueResult::Ok;
+  }
+  // The first LIST: two FILE frames and LIST_END all reach the client.
+  bool first_list_served() {
+    const std::uint8_t file_a[] = {ble::kFrameFile, 1, 0, 0, 0, 'a'};
+    const std::uint8_t file_b[] = {ble::kFrameFile, 2, 0, 0, 0, 'b'};
+    const std::uint8_t list_end[] = {ble::kFrameListEnd, 2, 0, 0, 0};
+    return send(file_a) == EnqueueResult::Ok &&
+           send(file_b) == EnqueueResult::Ok &&
+           send(list_end) == EnqueueResult::Ok;
+  }
+};
+
+void test_restore_before_connect_serves_first_list() {
+  // NimBLE holds CONNECT back for the remote version and feature reads. The
+  // Mac encrypts with its bond meanwhile, so ENC_CHANGE and the RESTORE
+  // subscribe (Response and Status) arrive first, for an unknown handle.
+  Transport link;
+  link.on_disconnect();
+  link.on_enc_change(1);
+  link.on_subscribe(1, kResponse, true);
+  link.on_subscribe(1, 1, true);
+  link.on_connect(1); // logs via=connect, the link is already secure
+  assert(link.authenticated);
+  assert(link.subscribed[kResponse] && link.subscribed[1]);
+  // The held restore opened nothing new, it is the stream CONNECT opened.
+  const auto generation = link.generation;
+  assert(link.first_list_served() && link.fault_logs == 0);
+  assert(link.generation == generation);
+  // The Mac never writes the CCCD again on this link, yet a later LIST and an
+  // unsubscribe and resubscribe behave like after any CCCD write.
+  assert(link.first_list_served());
+  link.on_subscribe(1, kResponse, false);
+  link.on_subscribe(1, kResponse, true);
+  assert(link.generation == generation + 1 && link.first_list_served());
+}
+
+void test_secure_at_connect_restore_after_serves_first_list() {
+  // The CoreS3 phone order. CONNECT first, then ENC_CHANGE and the restore.
+  Transport link;
+  link.on_connect(3);
+  assert(!link.authenticated && !link.subscribed[kResponse]);
+  link.on_enc_change(3);
+  link.on_subscribe(3, kResponse, true);
+  assert(link.authenticated && link.first_list_served());
+  assert(link.fault_logs == 0 && link.early.held == ble::PendingCccd::kNone);
+  // And a link already secure at CONNECT whose client writes the CCCD after.
+  Transport later;
+  later.on_enc_change(4);
+  later.on_connect(4);
+  assert(later.authenticated && !later.subscribed[kResponse]);
+  later.on_subscribe(4, kResponse, true);
+  assert(later.first_list_served() && later.fault_logs == 0);
+}
+
+void test_unsubscribed_refusal_is_logged() {
+  // No restore and no CCCD write. Every frame is refused as unsubscribed, the
+  // log says so once per session, and it is never a silent code 7.
+  Transport link;
+  link.on_enc_change(2);
+  link.on_connect(2);
+  assert(link.authenticated && !link.first_list_served());
+  const auto busy = error_frame(ble::kOpList, ble::kErrBusy);
+  assert(link.send(busy) == EnqueueResult::Closed);
+  assert(link.fault_logs == 1);
+  static_assert(ble::refusal_is_fault(ble::GateRefusal::Unsubscribed));
+  static_assert(ble::refusal_is_fault(ble::GateRefusal::Insecure));
+  static_assert(!ble::refusal_is_fault(ble::GateRefusal::Stale));
+  static_assert(!ble::refusal_is_fault(ble::GateRefusal::Disconnected));
+  static_assert(std::string_view(ble::refusal_name(
+                    ble::GateRefusal::Unsubscribed)) == "unsubscribed");
+  // A new session logs again.
+  link.on_disconnect();
+  link.on_connect(2);
+  assert(link.send(busy) == EnqueueResult::Closed && link.fault_logs == 2);
+  // The order of refusals. A dead or stale session is not a fault, and the
+  // live lookup runs last.
+  int lookups = 0;
+  const auto live = [&] { return ++lookups, false; };
+  assert(ble::response_refusal(false, true, true, live) ==
+         ble::GateRefusal::Disconnected);
+  assert(ble::response_refusal(true, false, true, live) ==
+         ble::GateRefusal::Stale);
+  assert(ble::response_refusal(true, true, false, live) ==
+         ble::GateRefusal::Unsubscribed);
+  assert(lookups == 0);
+  assert(ble::response_refusal(true, true, true, live) ==
+         ble::GateRefusal::Insecure);
+  assert(lookups == 1);
+}
+
+void test_pending_cccd() {
+  using ble::route_subscribe;
+  using ble::SubscribeRoute;
+  static_assert(route_subscribe(false, false) == SubscribeRoute::Hold);
+  static_assert(route_subscribe(true, true) == SubscribeRoute::Apply);
+  static_assert(route_subscribe(true, false) == SubscribeRoute::Drop);
+  ble::PendingCccd early;
+  int calls = 0;
+  const auto count = [&](unsigned, bool) { ++calls; };
+  // Nothing held, nothing applied.
+  assert(early.replay(1, count) == 0 && calls == 0);
+  // The last state per characteristic wins.
+  early.hold(1, kResponse, true);
+  early.hold(1, 2, true);
+  early.hold(1, 2, false);
+  std::array<int, 8> state{-1, -1, -1, -1, -1, -1, -1, -1};
+  assert(early.replay(1, [&](unsigned i, bool on) { state[i] = on; }) == 2);
+  assert(state[kResponse] == 1 && state[2] == 0 && state[0] == -1);
+  // Replay forgets, so a second CONNECT sees nothing.
+  assert(early.replay(1, count) == 0);
+  // A held state of another handle is never applied, and is forgotten.
+  early.hold(5, kResponse, true);
+  assert(early.replay(6, count) == 0 && calls == 0);
+  assert(early.replay(5, count) == 0);
+  // A new handle replaces an older pending one.
+  early.hold(5, kResponse, true);
+  early.hold(6, 1, true);
+  assert(early.replay(6,
+                      [&](unsigned i, bool on) {
+                        assert(i == 1 && on);
+                        ++calls;
+                      }) == 1 &&
+         calls == 1);
+  // An index past the bit set is ignored.
+  early.hold(7, ble::PendingCccd::kMax, true);
+  assert(early.replay(7, count) == 0);
+  early.hold(7, kResponse, true);
+  early.clear();
+  assert(early.replay(7, count) == 0 && calls == 1);
+}
+
+// link_on_host()'s Dle and PHY steps on a callout, in milliseconds. Central
+// events and the callout run in time order on the host task, as in
+// ble_sync.cpp. CONNECT itself sends nothing.
+struct LinkSequence {
+  static constexpr std::int64_t kSettleMs = 2000;   // kLinkSettleMs
+  static constexpr std::uint16_t kWantOctets = 251; // data_len_octets
+  ble::LinkStep step = ble::LinkStep::Idle;
+  std::int64_t due_ms = -1;
+  std::int64_t dle_ms = -1;
+  std::int64_t requested_ms = -1;
+  std::uint16_t central_tx_octets = 0; // the last DATA_LEN_CHG
+  std::uint8_t tx = 1, rx = 1;         // 1M until a PHY update
+
+  // The latch, via CONNECT or ENC_CHANGE. Dle runs on the next queue turn.
+  void start(std::int64_t now) {
+    step = ble::LinkStep::Dle;
+    due_ms = now;
+  }
+  // Runs the callout if it fell due before `now`.
+  void advance(std::int64_t now) {
+    if (due_ms < 0 || due_ms > now)
+      return;
+    if (step == ble::LinkStep::Dle) {
+      step = ble::LinkStep::Phy;
+      if (ble::dle_request_needed(central_tx_octets, kWantOctets))
+        dle_ms = due_ms;
+      due_ms += kSettleMs;
+      if (due_ms > now)
+        return;
+    }
+    if (step != ble::LinkStep::Phy)
+      return;
+    step = ble::LinkStep::Interval;
+    if (ble::phy_request_needed(true, tx, rx))
+      requested_ms = due_ms;
+  }
+  void central(std::int64_t now) {
+    advance(now);
+    if (ble::central_procedure_rearms(step))
+      due_ms = now + kSettleMs;
+  }
+};
+
+// The CoreS3 Android bench (2026-10-18). The link is secure at CONNECT and
+// the phone's MTU exchange and connection update land around 2 s, where the
+// fixed wait sent the PHY request into the phone's own update.
+void test_phy_request_waits_for_central_procedures() {
+  using ble::LinkStep;
+  static_assert(ble::central_procedure_rearms(LinkStep::Phy));
+  static_assert(!ble::central_procedure_rearms(LinkStep::Idle));
+  static_assert(!ble::central_procedure_rearms(LinkStep::Dle));
+  static_assert(!ble::central_procedure_rearms(LinkStep::Interval));
+  static_assert(!ble::central_procedure_rearms(LinkStep::Done));
+  LinkSequence link;
+  link.start(0);
+  link.central(1900); // MTU 517
+  link.central(2200); // the phone's connection update
+  link.advance(10000);
+  assert(link.step == LinkStep::Interval);
+  assert(link.requested_ms == 2200 + LinkSequence::kSettleMs);
+  // Once the PHY step ran, a central event changes nothing.
+  link.central(4300);
+  assert(link.requested_ms == 4200 && link.step == LinkStep::Interval);
+  // A quiet central still gets the request after one settle.
+  LinkSequence quiet;
+  quiet.start(100);
+  quiet.advance(10000);
+  assert(quiet.requested_ms == 2100);
+}
+
+// A central that moved the link to 2M itself sees no local PHY procedure.
+void test_phy_request_skipped_on_2m() {
+  static_assert(!ble::phy_request_needed(true, ble::kPhy2M, ble::kPhy2M));
+  static_assert(ble::phy_request_needed(true, ble::kPhy2M, 1));
+  static_assert(ble::phy_request_needed(true, 1, ble::kPhy2M));
+  static_assert(ble::phy_request_needed(false, ble::kPhy2M, ble::kPhy2M));
+  LinkSequence link;
+  link.start(0);
+  link.tx = link.rx = ble::kPhy2M; // the phone's PHY update
+  link.central(800);
+  link.advance(10000);
+  assert(link.step == ble::LinkStep::Interval && link.requested_ms == -1);
+  // Only one direction on 2M still asks.
+  LinkSequence half;
+  half.start(0);
+  half.tx = ble::kPhy2M;
+  half.advance(10000);
+  assert(half.requested_ms == 2000);
+}
+
+// The CoreS3 core dumps (2026-10-18). Data length at CONNECT timed out while
+// the bonded phone started encryption. It now waits for the latch and goes
+// out before the PHY request.
+void test_dle_waits_for_latch_and_precedes_phy() {
+  LinkSequence link;
+  link.advance(5000); // connected, not yet secure
+  assert(link.step == ble::LinkStep::Idle && link.dle_ms == -1);
+  link.start(5100);
+  link.advance(5100);
+  assert(link.dle_ms == 5100 && link.step == ble::LinkStep::Phy);
+  assert(link.requested_ms == -1);
+  link.advance(10000);
+  assert(link.requested_ms == 5100 + LinkSequence::kSettleMs);
+  assert(link.dle_ms < link.requested_ms);
+}
+
+// A central that set the data length itself sees no local request.
+void test_dle_skipped_when_central_set_it() {
+  static_assert(ble::dle_request_needed(0, 251));
+  static_assert(ble::dle_request_needed(27, 251));
+  static_assert(!ble::dle_request_needed(251, 251));
+  static_assert(!ble::dle_request_needed(251, 200));
+  LinkSequence link;
+  link.central_tx_octets = 251;
+  link.start(0);
+  link.advance(10000);
+  assert(link.dle_ms == -1 && link.requested_ms == 2000);
+  // A shorter length from the central still asks.
+  LinkSequence short_central;
+  short_central.central_tx_octets = 27;
+  short_central.start(0);
+  short_central.advance(10000);
+  assert(short_central.dle_ms == 0);
+}
 } // namespace
 
 int main() {
@@ -566,6 +1017,17 @@ int main() {
   test_classify_close();
   test_stall_close();
   test_flag_watch();
+  test_stale_flag_secure_link_is_served();
+  test_insecure_link_gets_visible_error_14();
+  test_no_auth_refusal_answers_busy();
+  test_restore_before_connect_serves_first_list();
+  test_secure_at_connect_restore_after_serves_first_list();
+  test_unsubscribed_refusal_is_logged();
+  test_pending_cccd();
+  test_phy_request_waits_for_central_procedures();
+  test_phy_request_skipped_on_2m();
+  test_dle_waits_for_latch_and_precedes_phy();
+  test_dle_skipped_when_central_set_it();
   std::printf("ble policy passed\n");
   return 0;
 }
