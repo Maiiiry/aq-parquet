@@ -342,4 +342,24 @@ constexpr std::uint8_t kPhy2M = 2;
                                                 std::uint8_t rx) {
   return !read_ok || tx != kPhy2M || rx != kPhy2M;
 }
+
+// BLE HCI fail lines for the connection update. While a procedure runs the
+// host refuses it (BLE_HS_EBUSY, BLE_HS_EALREADY). The link step and the relax
+// timer retry every second, and a refused active request from a Control write
+// is retried by the next write, however late. Only the first failure of a run
+// with the same rc is logged, so a later failure with that rc stays silent
+// until a success, a new connection or a host reset ends the run.
+class HciFailLog {
+public:
+  // True when this result of the command should be logged.
+  [[nodiscard]] bool on_result(int rc) {
+    const bool fresh = rc != 0 && rc != last_rc_;
+    last_rc_ = rc;
+    return fresh;
+  }
+  void reset() { last_rc_ = 0; }
+
+private:
+  int last_rc_ = 0;
+};
 } // namespace ble
