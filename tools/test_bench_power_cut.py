@@ -159,6 +159,8 @@ class FakeBoard:
         found = list(self.partials)
         self.partials.clear()
         self.quarantine_files += len(found)
+        self.emit(now + 0.1, "ESP-ROM:esp32s3-20210327")
+        self.emit(now + 0.15, "PARQUET CODEC codec=LZ4_RAW source=nvs")
         self.emit(now + 0.2, f"PARQUET BEGIN schema=v5 columns=62 sample_s=10 interval_s=900 max_rows=90 "
                              f"max_row_groups=8 psram_workspace_bytes=1 row_bytes=1 boot={self.boot} "
                              f"station=st codec=lz4 crc32_check=on")
@@ -314,6 +316,65 @@ def test_account() -> None:
     require(c["boot"] == "C" and c["finalized_rows"] == 5 and totals["boots"] == 3, f"boot C {c}")
     gap = bpc.account(bpc.parse_line(l) for l in ["PARQUET ROW sequence=1", "PARQUET ROW sequence=4"])
     require(gap["boots"][0]["boot"] == "unknown" and gap["boots"][0]["log_gap_rows"] == 2, "gaps before BEGIN")
+
+    # BEGIN prints before the storage worker runs (#35), so a boot's recovery
+    # lines sit right behind its own BEGIN and never under the boot before.
+    # Lines from before the first BEGIN of a log stay in an unknown boot.
+    strict = bpc.account(bpc.parse_line(l) for l in [
+        "PARQUET RECOVERY quarantined=7 repaired=0 deleted=0",
+        "PARQUET ROW sequence=40 buffered=1 dropped=0",
+        "PARQUET BEGIN boot=A columns=62",
+        "PARQUET QUARANTINE source=P/aq_Z_0-1.partial target=q/aq_Z_0-1.partial bytes=10 origin=boot",
+        "PARQUET RECOVERY quarantined=1 repaired=0 deleted=0",
+        "PARQUET SCAN files=0 retained_partials=0 quarantine_files=1 quarantine_bytes=10",
+        "PARQUET ROW sequence=0 buffered=1 dropped=0",
+        "PARQUET BEGIN boot=B columns=62",
+        "PARQUET RECOVERY quarantined=0 repaired=0 deleted=0",
+        "PARQUET SCAN files=0 retained_partials=0 quarantine_files=1 quarantine_bytes=10",
+    ])
+    early, first, second = strict["boots"]
+    require(early["boot"] == "unknown" and early["recovery_quarantined"] == 7 and early["rows_seen"] == 1,
+            f"lines before the first BEGIN {early}")
+    require(first["boot"] == "A" and first["recovery_quarantined"] == 1
+            and first["quarantined"] == ["P/aq_Z_0-1.partial"] and first["scan"]["files"] == 0
+            and first["rows_seen"] == 1, f"boot A keeps its own recovery {first}")
+    require(second["boot"] == "B" and second["recovery_quarantined"] == 0 and second["quarantined"] == []
+            and second["rows_seen"] == 0, f"boot B {second}")
+
+    # begin() prints its own lines before BEGIN, such as the watchdog reset
+    # error. They belong to the boot that starts at the ROM banner, or at
+    # PARQUET CODEC when the capture missed the banner, never to the boot before.
+    require(bpc.parse_line("ESP-ROM:esp32s3-20210327") == {"kind": "RESET", "rom": "esp32s3-20210327"},
+            "ROM banner parsed")
+    reset_line = "PARQUET ERROR operation=worker-watchdog-reset consecutive=1"
+    banner = bpc.account(bpc.parse_line(l) for l in [
+        "PARQUET BEGIN boot=A columns=62",
+        "PARQUET ROW sequence=0 buffered=1 dropped=0",
+        "ESP-ROM:esp32s3-20210327",
+        "PARQUET CODEC codec=LZ4_RAW source=nvs",
+        reset_line,
+        "PARQUET RECOVERY quarantined=1 repaired=0 deleted=0",
+        "PARQUET BEGIN boot=B columns=62",
+        "PARQUET RECOVERY quarantined=2 repaired=0 deleted=0",
+        "PARQUET ROW sequence=0 buffered=1 dropped=0",
+        "PARQUET CODEC codec=LZ4_RAW source=nvs",
+        reset_line,
+        "PARQUET BEGIN boot=C columns=62",
+        "PARQUET CODEC codec=LZ4_RAW source=nvs",
+        "PARQUET ERROR operation=allocate logging=false",
+        "ESP-ROM:esp32s3-20210327",
+        "PARQUET BEGIN boot=D columns=62",
+    ])
+    names = [b["boot"] for b in banner["boots"]]
+    require(names == ["A", "B", "C", "unknown", "D"], f"boots split at the banner and CODEC {names}")
+    a, b, c, failed, d = banner["boots"]
+    require(a["errors"] == [] and a["recovery_quarantined"] == 0 and a["rows_seen"] == 1, f"boot A {a}")
+    require([e.get("operation") for e in b["errors"]] == ["worker-watchdog-reset"]
+            and b["recovery_quarantined"] == 3 and b["rows_seen"] == 1, f"boot B starts at its banner {b}")
+    require([e.get("operation") for e in c["errors"]] == ["worker-watchdog-reset"]
+            and c["rows_seen"] == 0, f"boot C starts at CODEC without a banner {c}")
+    require([e.get("operation") for e in failed["errors"]] == ["allocate"], f"a boot with no BEGIN {failed}")
+    require(d["errors"] == [], f"boot D {d}")
 
 
 def test_classify_and_plan() -> None:
