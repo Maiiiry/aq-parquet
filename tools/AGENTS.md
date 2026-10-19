@@ -18,7 +18,8 @@ C++ contract tests and cannot prove behavior on a physical board.
 | Discharge run curve of `battery_mv`, SOC, CRATE and `battery_health_state` against UTC as SVG, with power-critical closes and reboot loop small files per boot from serial or LOG_TAIL logs, overlapping polls joined, logs oldest first (owner bench, #61 item 1, tests use a generated run) | `analyze-discharge <files> --log <log> --out <dir>`, `analyze-discharge-test` |
 | Full-flash backup publication (offline fake esptool) | `backup-test` |
 | Native FAT mount root and archive directory creation | `logger-directory-test` |
-| Per-file C++ dialect of an SDK fixture build, and every fixture entry point calling it | `check_idf_target.py --compile-dialect <build>`, `compile-dialect-test` |
+| Per-file C++ dialect and source path map of an SDK fixture build, and every fixture entry point calling it without swallowing its exit | `check_idf_target.py --compile-dialect <build>`, `compile-dialect-test` |
+| One board built from two checkout paths gives the same images (SDK, CI job) | `repro-paths-check [board] [variant]`, `repro-paths-test` |
 | Native SDK and affected board builds | `idf-setup`, `cores3-build`, `waveshare-build [logger|diagnostic]` |
 | Shared sensor drivers on fake buses | `pms-frame-test`, `ltr553-test`, `max17048-test` |
 | Battery health states, thresholds, debounce, settling and the boot Low or Critical tie | `battery-health-test` |
