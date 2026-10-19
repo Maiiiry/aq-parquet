@@ -250,6 +250,8 @@ and by hand from the Actions tab (`workflow_dispatch`).
   A skipped job passes only when its id is listed in `ALLOWED_SKIPS` in that
   job, which is empty today because no job has an `if:`. It is the single
   required check.
+- `.github/workflows/release.yml` is a separate workflow for `v*` tags and
+  is not part of `CI result`, see [Cutting a release](#cutting-a-release).
 - Dependabot opens one grouped pull request a week for action pin updates,
   only for releases at least 7 days old (`.github/dependabot.yml`).
 
@@ -282,6 +284,7 @@ job name `CI result` stable. If a merge queue is enabled later, add a
 | Storage governor, CRC cache or DMA buffer | `storage-governor-test`, `crc-cache-test`, `sd-transfer-buffer-test` |
 | Backup tooling | `backup-test` with offline fake esptool |
 | App signing or the tracked secrets guard | `release-sign-test`, `secrets-check-test` |
+| Release workflow | `release-workflow-test`, then `actionlint` and `zizmor` as in CI |
 | CMake helpers, compile flags or `sdkconfig` defaults | `repro-paths-check`, `compile-dialect-test` |
 | Diagnostic or PSRAM configuration | `waveshare-build diagnostic`, `waveshare-psram-build` |
 
@@ -425,6 +428,95 @@ run when
 It never prints the key, the `.env` values or any file contents. It names the
 key only as `secrets/<name>`. `release-sign-test` and `secrets-check-test`
 use throwaway keys in a temp dir and never touch `secrets/`.
+
+## Cutting a release
+
+`.github/workflows/release.yml` runs when a `v*` tag is pushed. It builds the
+CoreS3 and Waveshare logger images with the same pinned SDK and build tasks as
+CI, with no cache. It then creates a **draft** release that holds the unsigned
+app images, one SPDX SBOM per image from `esp-idf-sbom`, `SHA256SUMS` and a
+build provenance attestation for every file in `SHA256SUMS`. Assets are named
+`aq_cores3-bringup-<tag>.bin` and `aq_waveshare-logger-<tag>.bin`. CI never
+holds the signing key and never publishes. A manual run from the Actions tab
+on any branch is a dry run. It builds and uploads the same files as the
+`release-files` artifact and creates no release. A re-run for a tag that
+already has a release, draft or published, fails before it attests or uploads
+anything. `release-workflow-test` in the host gate pins these rules.
+
+The release holds app images only, with no bootloader, partition table or
+`flash_args`. It serves an OTA update or an app only flash of a board that
+already runs this firmware. It cannot first flash a blank board. For that, use
+the build and flash workflow of the
+[CoreS3](../../firmware/esp-idf-cores3/README.md#current-build-and-flash-workflow)
+or the
+[Waveshare V2](../../firmware/esp-idf-waveshare-sim7670g/README.md#current-build-and-flash-workflow)
+and the checks in the root `AGENTS.md` before any physical flash write.
+
+Run these from the repository root, with `v1.2.0` standing for the new tag.
+
+1. Check that CI passed on the `main` commit. The command prints `success`
+   only when every job, `CI result` included, passed. Then tag the commit and
+   push the tag.
+
+   ```sh
+   gh run list --workflow ci.yml --commit <main-commit> --event push \
+     --json conclusion --jq '.[0].conclusion'
+   git tag -a v1.2.0 -m v1.2.0 <main-commit>
+   git push origin v1.2.0
+   ```
+
+2. Wait for the Release workflow to finish and the draft to appear. The run
+   can take a few seconds to show up after the push, so the loop waits for it.
+   `--exit-status` makes the watch fail when the run fails. The run is also on
+   the repository Actions page under Release.
+
+   ```sh
+   until run_id="$(gh run list --workflow release.yml --branch v1.2.0 --event push \
+       --limit 1 --json databaseId --jq '.[0].databaseId // empty')" && [ -n "$run_id" ]; do
+     sleep 10
+   done
+   gh run watch "$run_id" --exit-status
+   ```
+
+3. Download the draft and check it against `SHA256SUMS`. Then check the
+   attestation of every image and SBOM, tied to `release.yml` so an
+   attestation from any other workflow in the repository does not pass.
+
+   ```sh
+   gh release download v1.2.0 --dir exports/release-v1.2.0/unsigned
+   (cd exports/release-v1.2.0/unsigned && shasum -a 256 -c SHA256SUMS)
+   for f in exports/release-v1.2.0/unsigned/*.bin exports/release-v1.2.0/unsigned/*.spdx.json; do
+     gh attestation verify "$f" --repo walkthru-earth/aq-parquet \
+       --signer-workflow walkthru-earth/aq-parquet/.github/workflows/release.yml
+   done
+   ```
+
+4. Sign the app images with the local key, see [Local app signing](#local-app-signing).
+
+   ```sh
+   pixi run release-sign --out exports/release-v1.2.0/signed exports/release-v1.2.0/unsigned/*.bin
+   ```
+
+5. Join both checksum lists into one `SHA256SUMS`, then upload it with the
+   signed images. It replaces the draft `SHA256SUMS`.
+
+   ```sh
+   cat exports/release-v1.2.0/unsigned/SHA256SUMS exports/release-v1.2.0/signed/SHA256SUMS \
+     | LC_ALL=C sort -k 2 > exports/release-v1.2.0/SHA256SUMS
+   gh release upload v1.2.0 --clobber \
+     exports/release-v1.2.0/signed/*.signed.bin exports/release-v1.2.0/SHA256SUMS
+   ```
+
+6. Review the draft on GitHub, then publish it.
+
+   ```sh
+   gh release edit v1.2.0 --draft=false
+   ```
+
+The attestation covers the unsigned images and SBOMs as CI built them. The
+signed images are those bytes plus the owner signature block, and the owner
+key is their proof of origin. Until #40 the firmware does not check that
+signature.
 
 ## Owner maintenance
 
