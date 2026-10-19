@@ -4,6 +4,17 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 # The C++ standard below must match the firmware helper and the host tests.
 python tools/check_idf_target.py --cxx-dialect
+# Shared code takes board capabilities from hooks, ServiceConfig and sdkconfig
+# defaults, never from a board name (AGENTS.md, code boundaries). The check
+# exits 0 when clean, 1 on a finding and 2 when it cannot run. Only 0 passes,
+# so an error can never read as clean.
+board_rc=0
+python tools/check_board_conditionals.py firmware/common || board_rc=$?
+case "${board_rc}" in
+  0) ;;
+  1) exit 1 ;;
+  *) printf '!!! board conditional check failed to run (exit %s)\n' "${board_rc}" >&2; exit 1 ;;
+esac
 options=(--language=c++ --enable=warning,style,performance,portability
   --inline-suppr --error-exitcode=1 --std=c++23 --max-configs=1
   '--suppress=*:*/vendor/lz4/*')
