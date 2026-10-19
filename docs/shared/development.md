@@ -108,7 +108,10 @@ or when a `tools/test_*.py` hardcodes a C++ `-std` instead of importing
 which repeats that check and reads `build/<variant>/compile_commands.json`. It
 fails when the last `-std` on any repo-owned `.cpp` is not the pinned GNU
 dialect, or when a repo `.c` file gets a C++ standard. `managed_components` and
-build outputs are skipped. Style rules live at the top of
+build outputs are skipped. The logger compile test, the connectivity
+fixture and the PSRAM probe have no board target, so they run only that
+per-file check with `check_idf_target.py --compile-dialect <build>`, and
+`compile-dialect-test` fails if one of them stops calling it. Style rules live at the top of
 [`AGENTS.md`](../../AGENTS.md#c-standard-and-style).
 
 On 2026-10-17 one `std::format_to_n` call added to the CoreS3 image at `-Og`
@@ -199,7 +202,11 @@ and by hand from the Actions tab (`workflow_dispatch`).
   and 7 days otherwise. The job summary shows a size table. For a pull request
   the change is measured against the green build of its base commit, else
   against the newest green `main` build, and the summary names which commit
-  was used.
+  was used. A malformed baseline prints a warning and the absolute table.
+- Each board job then runs `ota-slot-check`, which fails when the app image
+  uses more than half of the smallest app slot in that variant's
+  `partitions.csv`. The share and the measurements behind it live in
+  `tools/ota_slot_check.py`.
 - **CI result** waits for every other job and fails unless each one passed.
   A skipped job passes only when its id is listed in `ALLOWED_SKIPS` in that
   job, which is empty today because no job has an `if:`. It is the single

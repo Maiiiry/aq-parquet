@@ -17,6 +17,7 @@ C++ contract tests and cannot prove behavior on a physical board.
 | Power cut cycles at the write, footer and rename stages, per boot loss account, baseline SHA-256 manifest and compare (owner bench only, tests use a fake port) | `bench-power-cut run|analyze|manifest|compare`, `bench-power-cut-test` |
 | Full-flash backup publication (offline fake esptool) | `backup-test` |
 | Native FAT mount root and archive directory creation | `logger-directory-test` |
+| Per-file C++ dialect of an SDK fixture build, and every fixture entry point calling it | `check_idf_target.py --compile-dialect <build>`, `compile-dialect-test` |
 | Native SDK and affected board builds | `idf-setup`, `cores3-build`, `waveshare-build [logger|diagnostic]` |
 | Shared sensor drivers on fake buses | `pms-frame-test`, `ltr553-test`, `max17048-test` |
 | Battery health states, thresholds, debounce, settling and the boot Low or Critical tie | `battery-health-test` |
@@ -27,7 +28,8 @@ C++ contract tests and cannot prove behavior on a physical board.
 | LIVE key set frozen per dictionary digest (`fixtures/live_keys/`) | `telemetry-contract-test`, `waveshare-contract-test` |
 | Formatting and static diagnostics | `fmt-check`, `lint` |
 | Full host gate, same entry point as CI | `gate` (`tools/gate.sh`, add new host test tasks to its list) |
-| CI image size table from `idf.py size --format json2` | `size_report.py` |
+| CI image size table from `idf.py size --format json2`, absolute sizes with a warning when the baseline is malformed | `size_report.py`, `size-report-test` |
+| App image share of the smallest app slot in the board `partitions.csv`, fail closed over the budget in the tool | `ota-slot-check --label --partitions --build`, `ota-slot-check-test` |
 | Static task stack worst case, xTaskCreate name and stack size cross check, and linker section budgets per image (`stack_budget.json`) | `stack-budget [--check] [--path]`, `stack-budget-test` |
 
 - Never write eFuses or format SD; flash writes require the root `AGENTS.md`

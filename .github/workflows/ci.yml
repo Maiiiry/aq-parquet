@@ -176,6 +176,7 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.name }}-${{ steps.idf.outputs.commit }}-
       - name: Build
+        id: build
         env:
           TASK: ${{ matrix.task }}
           EXTRA_TASK: ${{ matrix.extra_task }}
@@ -280,11 +281,26 @@ jobs:
             ${{ matrix.project }}/build/${{ matrix.variant }}/flash_args
           if-no-files-found: error
           retention-days: ${{ github.ref == 'refs/heads/main' && 90 || 7 }}
+      # Fail closed when the app image uses more than half of its smallest app
+      # slot. The slot size comes from the board partitions.csv and the share
+      # and its reasoning live in tools/ota_slot_check.py (issue #45).
+      - name: Check OTA slot share
+        if: matrix.project
+        env:
+          NAME: ${{ matrix.name }}
+          PROJECT: ${{ matrix.project }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          pixi run ota-slot-check --label "${NAME} (${VARIANT})" \
+            --partitions "${PROJECT}/${VARIANT}/partitions.csv" \
+            --build "${PROJECT}/build/${VARIANT}" >> "$GITHUB_STEP_SUMMARY"
       # Static task stack worst case and linker section sizes against
       # tools/stack_budget.json (issue #37). The image key is the board before
       # the first dash of the leg name plus the variant, such as cores3/bringup.
       - name: Check stack and section budgets
-        if: matrix.project
+        # Still runs when the OTA slot check above failed, so that leg keeps
+        # its stack and section table. The OTA failure still fails the job.
+        if: ${{ !cancelled() && matrix.project && steps.build.outcome == 'success' }}
         env:
           NAME: ${{ matrix.name }}
           VARIANT: ${{ matrix.variant }}
